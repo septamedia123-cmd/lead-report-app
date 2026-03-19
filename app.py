@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 CC_EMAIL = "erica@livmed.us"
-LOGO_FILE = "livmed-green-hd.png"
+LOGO_FILE = "logo.png"
 
 
 def normalize_text(value):
