@@ -275,7 +275,7 @@ def render_mapping_manager(report_key, report_name, identifier_label):
     st.subheader(f"{report_name} Mappings")
     st.info(
         "Use this mapping table to manage identifiers, center names, and email addresses. "
-        "Changes persist for the current deployed app session, but to keep a backup, download the CSV after editing."
+        "Download the CSV after editing to keep a backup."
     )
 
     uploaded_mapping = st.file_uploader(
@@ -376,6 +376,54 @@ def send_vendor_emails(vendor_files, sender_email, gmail_app_password, test_mode
 
     server.quit()
     return sent_count
+
+
+def get_file_extension(uploaded_file):
+    name = uploaded_file.name.lower()
+    if "." not in name:
+        return ""
+    return name.rsplit(".", 1)[1]
+
+
+def validate_uploaded_file(uploaded_file, expected_type, report_name):
+    ext = get_file_extension(uploaded_file)
+
+    if expected_type == "excel":
+        if ext not in ["xlsx", "xls"]:
+            st.error(
+                f"{report_name} requires an Excel file (.xlsx or .xls). "
+                f"You uploaded: {uploaded_file.name}"
+            )
+            st.info("Please go back and upload the original Excel workbook for this report.")
+            return False
+
+    if expected_type == "csv":
+        if ext != "csv":
+            st.error(
+                f"{report_name} requires a CSV file (.csv). "
+                f"You uploaded: {uploaded_file.name}"
+            )
+            st.info("Please go back and upload the CSV export for this report.")
+            return False
+
+    return True
+
+
+def render_upload_instructions(report_name, expected_type):
+    if expected_type == "excel":
+        st.info(
+            f"Upload the **{report_name} Excel workbook** in `.xlsx` or `.xls` format. "
+            "For CGM and Med Advantage, the workbook should include the required report tabs."
+        )
+    else:
+        st.info(
+            f"Upload the **{report_name} CSV file** in `.csv` format."
+        )
+
+
+def render_excel_tab_requirements(report_name):
+    if report_name in ["CGM Report", "Med Advantage Report"]:
+        st.caption("Expected workbook tabs: **Detail** and ideally **Conversion Stats**.")
 
 
 # =========================
@@ -579,6 +627,9 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
 
         show_mode_banner(test_mode)
 
+        render_upload_instructions(report_name, file_type)
+        render_excel_tab_requirements(report_name)
+
         uploaded_file = st.file_uploader(
             f"Upload {report_name} file",
             type=["xlsx", "xls"] if file_type == "excel" else ["csv"],
@@ -589,6 +640,9 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
             st.info(f"Upload a file to begin the {report_name.lower()} workflow.")
             return
 
+        if not validate_uploaded_file(uploaded_file, file_type, report_name):
+            return
+
         try:
             workbook_lookup = pd.DataFrame(columns=["Identifier", "CenterName", "Email"])
             detail_df = pd.DataFrame()
@@ -597,7 +651,19 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
             paidamount_col = None
 
             if file_type == "excel":
-                xls = pd.ExcelFile(uploaded_file)
+                try:
+                    xls = pd.ExcelFile(uploaded_file)
+                except ImportError:
+                    st.error(
+                        "This app needs the Excel package `openpyxl` installed to read Excel files. "
+                        "Please update `requirements.txt` to include `openpyxl` and reboot the app."
+                    )
+                    return
+                except Exception as e:
+                    st.error(f"Could not open this Excel file: {e}")
+                    st.info("Please make sure you uploaded a valid Excel workbook.")
+                    return
+
                 sheet_names = xls.sheet_names
 
                 detail_sheet = None
@@ -611,7 +677,8 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                         conversion_sheet = sheet
 
                 if detail_sheet is None:
-                    st.error("Could not find the Detail sheet.")
+                    st.error("Could not find the Detail sheet in this workbook.")
+                    st.info("Please upload the original report workbook that includes a Detail tab.")
                     return
 
                 detail_df = pd.read_excel(uploaded_file, sheet_name=detail_sheet)
@@ -619,7 +686,10 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
 
                 if needs_conversion_stats:
                     if conversion_sheet is None:
-                        st.warning("Could not find the Conversion Stats sheet. The app will rely on the mapping table.")
+                        st.warning(
+                            "Could not find the Conversion Stats sheet. "
+                            "The app will use the report mapping table instead."
+                        )
                         conversion_df = pd.DataFrame()
                     else:
                         conversion_df = pd.read_excel(uploaded_file, sheet_name=conversion_sheet)
@@ -627,18 +697,23 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                         workbook_lookup = build_workbook_lookup(conversion_df)
 
                 id_col = find_column(detail_df, [identifier_label, identifier_label.replace(" ", "")])
-                payable_col = find_column(detail_df, ["Payable"])
                 paidamount_col = find_column(detail_df, ["PaidAmount", "Paid Amount"])
                 disposition_col = find_column(detail_df, ["Disposition"])
 
                 if id_col is None:
                     st.error(f"Could not find {identifier_label} in the Detail sheet.")
+                    st.info("Please verify you uploaded the correct workbook for this report.")
                     return
 
                 merged_df = merge_with_mapping(detail_df, id_col, get_mapping_df(report_key), workbook_lookup)
 
             else:
-                detail_df = pd.read_csv(uploaded_file)
+                try:
+                    detail_df = pd.read_csv(uploaded_file)
+                except Exception as e:
+                    st.error(f"Could not open this CSV file: {e}")
+                    st.info("Please make sure you uploaded a valid CSV export.")
+                    return
 
                 id_col = find_column(detail_df, [identifier_label, identifier_label.replace(" ", "")])
                 duration_col = find_column(detail_df, ["Duration"])
@@ -646,11 +721,13 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
 
                 if id_col is None:
                     st.error(f"Could not find {identifier_label} in the CSV.")
+                    st.info("Please verify you uploaded the correct ECP CSV report.")
                     return
 
                 if custom_payable_rule == "ecp":
                     if duration_col is None or disposition_col is None:
                         st.error("Could not find Duration and/or Disposition in the ECP CSV.")
+                        st.info("ECP requires both Duration and Disposition columns to calculate Payable.")
                         return
 
                     detail_df["Payable"] = detail_df.apply(
@@ -661,8 +738,12 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                         axis=1
                     )
 
-                payable_col = find_column(detail_df, ["Payable"])
-                merged_df = merge_with_mapping(detail_df, id_col, get_mapping_df(report_key), pd.DataFrame(columns=["Identifier", "CenterName", "Email"]))
+                merged_df = merge_with_mapping(
+                    detail_df,
+                    id_col,
+                    get_mapping_df(report_key),
+                    pd.DataFrame(columns=["Identifier", "CenterName", "Email"])
+                )
 
             # Summary
             summary_rows = []
@@ -700,7 +781,6 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
             if not summary_df.empty:
                 summary_df = summary_df.sort_values(by=["CenterName", "Identifier"], na_position="last")
 
-            # Disposition summary
             if disposition_col and disposition_col in merged_df.columns:
                 disposition_summary = (
                     merged_df.groupby(["Identifier_normalized", disposition_col])
@@ -874,7 +954,8 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
             st.info(f"Every email in this workflow will CC: {CC_EMAIL}")
 
         except Exception as e:
-            st.error(f"Something went wrong: {e}")
+            st.error(f"Something went wrong while processing this file: {e}")
+            st.info("Please verify that you uploaded the correct report file and that the expected columns are present.")
 
 
 # =========================
@@ -931,5 +1012,3 @@ elif current_page == "medadv":
         ],
         custom_payable_rule=None
     )
-else:
-    st.info("Upload an Excel workbook to begin.")
