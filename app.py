@@ -12,6 +12,7 @@ st.set_page_config(
 )
 
 CC_EMAIL = "erica@livmed.us"
+LOGO_FILE = "livmed-green-hd.png"
 
 
 def normalize_text(value):
@@ -110,7 +111,7 @@ def show_header():
     col1, col2 = st.columns([1, 3])
 
     with col1:
-        st.image("./logo.png", width=180)
+        st.image(LOGO_FILE, width=180)
 
     with col2:
         st.markdown(
@@ -147,24 +148,13 @@ def metric_card(label, value):
     )
 
 
-# -----------------------------
-# Secure values from Streamlit secrets
-# -----------------------------
 sender_email = st.secrets["EMAIL"]
 gmail_app_password = st.secrets["PASSWORD"]
 site_password = st.secrets["APP_PASSWORD"]
 
-
-# -----------------------------
-# Session auth
-# -----------------------------
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
-
-# -----------------------------
-# Login screen
-# -----------------------------
 if not st.session_state.authenticated:
     st.markdown(
         """
@@ -181,7 +171,7 @@ if not st.session_state.authenticated:
         unsafe_allow_html=True,
     )
 
-    st.image("./logo.png", width=260)
+    st.image(LOGO_FILE, width=260)
 
     st.markdown(
         """
@@ -211,10 +201,6 @@ if not st.session_state.authenticated:
     st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
 
-
-# -----------------------------
-# Main app
-# -----------------------------
 show_header()
 
 with st.sidebar:
@@ -231,7 +217,7 @@ with st.sidebar:
 show_mode_banner(test_mode)
 
 st.write(
-    "Upload the daily Excel workbook below. This app uses the **Detail** tab for raw rows and "
+    "Upload the daily Excel workbook below. This app uses the Detail tab for raw rows and "
     "**Conversion Stats** for center name and email matching."
 )
 
@@ -265,7 +251,6 @@ if uploaded_file:
         conversion_df = pd.read_excel(uploaded_file, sheet_name=conversion_sheet)
         uploaded_file.seek(0)
 
-        # Detect columns in Detail
         leadsource_col = find_column(detail_df, ["LeadSource", "Lead Source"])
         payable_col = find_column(detail_df, ["Payable"])
         paidamount_col = find_column(detail_df, ["PaidAmount", "Paid Amount"])
@@ -275,7 +260,6 @@ if uploaded_file:
             st.error("Could not find LeadSource in the Detail sheet.")
             st.stop()
 
-        # Detect columns in Conversion Stats
         identifier_col = conversion_df.columns[0]
         center_name_col = find_column(conversion_df, ["Center Name", "CenterName"])
         email_col = find_column(conversion_df, ["Email", "Email Address"])
@@ -303,9 +287,6 @@ if uploaded_file:
             how="left"
         )
 
-        # -----------------------------
-        # Summary data
-        # -----------------------------
         summary_rows = []
 
         for leadsource, group in merged_df.groupby("LeadSource_normalized"):
@@ -356,9 +337,6 @@ if uploaded_file:
         if not summary_df.empty:
             missing_email_df = summary_df[summary_df["Email"].astype(str).str.strip() == ""]
 
-        # -----------------------------
-        # Build vendor files
-        # -----------------------------
         zip_buffer = io.BytesIO()
         vendor_files = []
 
@@ -412,9 +390,6 @@ if uploaded_file:
 
         zip_buffer.seek(0)
 
-        # -----------------------------
-        # Top metrics
-        # -----------------------------
         total_centers = len(summary_df)
         total_rows = int(summary_df["TotalRows"].sum()) if not summary_df.empty else 0
         total_payable = int(summary_df["PayableY"].sum()) if not summary_df.empty else 0
@@ -430,9 +405,6 @@ if uploaded_file:
         with m4:
             metric_card("Ready to Send", ready_count)
 
-        # -----------------------------
-        # Tabs
-        # -----------------------------
         tab1, tab2, tab3, tab4 = st.tabs(["Review", "Downloads", "Email Queue", "Raw Preview"])
 
         with tab1:
