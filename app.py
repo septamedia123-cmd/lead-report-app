@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 CC_EMAIL = "erica@livmed.us"
-LOGO_FILE = "logo.png"
+LOGO_FILE = "logo-fixed.png"
 
 
 def normalize_text(value):
@@ -148,46 +148,63 @@ def metric_card(label, value):
     )
 
 
+# -----------------------------
+# Secure values from secrets
+# -----------------------------
 sender_email = st.secrets["EMAIL"]
 gmail_app_password = st.secrets["PASSWORD"]
 site_password = st.secrets["APP_PASSWORD"]
 
+
+# -----------------------------
+# Session auth
+# -----------------------------
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
+
+# -----------------------------
+# Centered login screen
+# -----------------------------
 if not st.session_state.authenticated:
     st.markdown(
         """
-        <div style="
-            max-width: 560px;
-            margin: 70px auto 20px auto;
-            background: white;
-            border: 1px solid #e5e7eb;
-            border-radius: 20px;
-            padding: 34px;
-            box-shadow: 0 12px 30px rgba(0,0,0,0.07);
-            text-align: center;">
+        <style>
+        .stApp {
+            background: linear-gradient(180deg, #020617 0%, #0f172a 100%);
+        }
+        </style>
         """,
-        unsafe_allow_html=True,
+        unsafe_allow_html=True
     )
 
-    st.image(LOGO_FILE, width=260)
-
-    st.markdown(
-        """
-        <div style="font-size: 30px; font-weight: 800; color: #111827; margin-top: 10px;">
-            LIVMED Lead Report Portal
-        </div>
-        <div style="font-size: 15px; color: #6b7280; margin-top: 8px; margin-bottom: 10px;">
-            Secure access required
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    col1, col2, col3 = st.columns([1.2, 2.2, 1.2])
+    col1, col2, col3 = st.columns([1, 2, 1])
 
     with col2:
+        st.markdown(
+            """
+            <div style="
+                text-align: center;
+                padding-top: 60px;
+                padding-bottom: 20px;">
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.image(LOGO_FILE, width=260)
+
+        st.markdown(
+            """
+            <div style="font-size: 30px; font-weight: 800; color: white; margin-top: 12px;">
+                LIVMED Lead Report Portal
+            </div>
+            <div style="font-size: 15px; color: #cbd5e1; margin-top: 8px; margin-bottom: 20px;">
+                Secure access required
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         entered_password = st.text_input("Access Password", type="password")
         login_clicked = st.button("Login", use_container_width=True)
 
@@ -198,9 +215,14 @@ if not st.session_state.authenticated:
             else:
                 st.error("Incorrect password.")
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
     st.stop()
 
+
+# -----------------------------
+# Main app
+# -----------------------------
 show_header()
 
 with st.sidebar:
@@ -217,7 +239,7 @@ with st.sidebar:
 show_mode_banner(test_mode)
 
 st.write(
-    "Upload the daily Excel workbook below. This app uses the Detail tab for raw rows and "
+    "Upload the daily Excel workbook below. This app uses the **Detail** tab for raw rows and "
     "**Conversion Stats** for center name and email matching."
 )
 
@@ -251,6 +273,7 @@ if uploaded_file:
         conversion_df = pd.read_excel(uploaded_file, sheet_name=conversion_sheet)
         uploaded_file.seek(0)
 
+        # Detect columns in Detail
         leadsource_col = find_column(detail_df, ["LeadSource", "Lead Source"])
         payable_col = find_column(detail_df, ["Payable"])
         paidamount_col = find_column(detail_df, ["PaidAmount", "Paid Amount"])
@@ -260,6 +283,7 @@ if uploaded_file:
             st.error("Could not find LeadSource in the Detail sheet.")
             st.stop()
 
+        # Detect columns in Conversion Stats
         identifier_col = conversion_df.columns[0]
         center_name_col = find_column(conversion_df, ["Center Name", "CenterName"])
         email_col = find_column(conversion_df, ["Email", "Email Address"])
@@ -287,6 +311,9 @@ if uploaded_file:
             how="left"
         )
 
+        # -----------------------------
+        # Summary data
+        # -----------------------------
         summary_rows = []
 
         for leadsource, group in merged_df.groupby("LeadSource_normalized"):
@@ -337,6 +364,9 @@ if uploaded_file:
         if not summary_df.empty:
             missing_email_df = summary_df[summary_df["Email"].astype(str).str.strip() == ""]
 
+        # -----------------------------
+        # Build vendor files
+        # -----------------------------
         zip_buffer = io.BytesIO()
         vendor_files = []
 
@@ -390,6 +420,9 @@ if uploaded_file:
 
         zip_buffer.seek(0)
 
+        # -----------------------------
+        # Top metrics
+        # -----------------------------
         total_centers = len(summary_df)
         total_rows = int(summary_df["TotalRows"].sum()) if not summary_df.empty else 0
         total_payable = int(summary_df["PayableY"].sum()) if not summary_df.empty else 0
@@ -405,6 +438,9 @@ if uploaded_file:
         with m4:
             metric_card("Ready to Send", ready_count)
 
+        # -----------------------------
+        # Tabs
+        # -----------------------------
         tab1, tab2, tab3, tab4 = st.tabs(["Review", "Downloads", "Email Queue", "Raw Preview"])
 
         with tab1:
