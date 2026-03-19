@@ -3,7 +3,9 @@ import smtplib
 import zipfile
 import pandas as pd
 import streamlit as st
+import gspread
 from email.message import EmailMessage
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(
     page_title="LIVMED Report Portal",
@@ -334,6 +336,48 @@ def render_mapping_manager(report_key, report_name, identifier_label):
         )
 
     st.caption(f"Identifier for this report: {identifier_label}")
+
+
+def get_gsheet_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=scopes
+    )
+    return gspread.authorize(creds)
+
+
+def log_report_run(
+    report_type,
+    total_rows,
+    payable_leads,
+    centers,
+    emails_sent,
+    mode,
+    missing_emails
+):
+    try:
+        gc = get_gsheet_client()
+        sheet = gc.open("LIVMED Report Logs").worksheet("logs")
+
+        new_row = [
+            pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            report_type,
+            total_rows,
+            payable_leads,
+            centers,
+            emails_sent,
+            mode,
+            missing_emails
+        ]
+
+        sheet.append_row(new_row)
+    except Exception as e:
+        st.warning(f"Run completed, but log could not be written to Google Sheets: {e}")
 
 
 def send_vendor_emails(vendor_files, sender_email, gmail_app_password, test_mode, test_email, report_name):
@@ -940,7 +984,19 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                             test_email=test_email,
                             report_name=report_name
                         )
+
                         st.success(f"Sent {sent_count} emails successfully.")
+
+                        log_report_run(
+                            report_type=report_name,
+                            total_rows=total_rows,
+                            payable_leads=total_payable,
+                            centers=total_centers,
+                            emails_sent=sent_count,
+                            mode="TEST" if test_mode else "LIVE",
+                            missing_emails=len(missing_email_df)
+                        )
+
                     except Exception as e:
                         st.error(f"Email error: {e}")
 
