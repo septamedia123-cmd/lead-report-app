@@ -376,10 +376,10 @@ def log_report_run(
         ]
 
         sheet.append_row(new_row, value_input_option="USER_ENTERED")
+        st.success("Run successfully logged to Google Sheets.")
 
     except Exception as e:
         st.warning(f"Run completed, but log could not be written to Google Sheets: {str(e)}")
-
 
 def send_vendor_emails(vendor_files, sender_email, gmail_app_password, test_mode, test_email, report_name):
     server = smtplib.SMTP("smtp.gmail.com", 587)
