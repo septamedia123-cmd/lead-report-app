@@ -1,6 +1,8 @@
 import io
 import smtplib
 import zipfile
+from datetime import datetime, timedelta
+
 import pandas as pd
 import streamlit as st
 import gspread
@@ -18,6 +20,38 @@ LOGO_FILE = "logo-fixed.png"
 GSHEET_ID = st.secrets["GSHEET_ID"]
 
 MAPPING_COLUMNS = ["Identifier", "CenterName", "Email", "Active", "Notes"]
+
+LOG_HEADERS = [
+    "Timestamp",
+    "ReportType",
+    "TotalRows",
+    "PayableLeads",
+    "Centers",
+    "EmailsSent",
+    "Mode",
+    "MissingEmails"
+]
+
+CENTER_LOG_HEADERS = [
+    "Timestamp",
+    "ReportType",
+    "CenterName",
+    "Identifier",
+    "TotalRows",
+    "PayableLeads",
+    "Email",
+    "MissingEmail",
+    "Mode"
+]
+
+ERROR_LOG_HEADERS = [
+    "Timestamp",
+    "ReportType",
+    "ErrorType",
+    "Details",
+    "Count",
+    "Mode"
+]
 
 
 # =========================
@@ -324,7 +358,7 @@ def render_mapping_manager(report_key, report_name, identifier_label):
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button(f"Save {report_name} Mapping Changes", key=f"{report_key}_save_mapping", use_container_width=True):
+        if st.button(f"Save {report_name} Mapping Changes", key=f"{report_key}_save_mapping", width="stretch"):
             set_mapping_df(report_key, edited_df)
             st.success("Mapping changes saved.")
     with c2:
@@ -333,12 +367,15 @@ def render_mapping_manager(report_key, report_name, identifier_label):
             data=edited_df.to_csv(index=False).encode("utf-8"),
             file_name=f"{report_key}_mapping.csv",
             mime="text/csv",
-            use_container_width=True
+            width="stretch"
         )
 
     st.caption(f"Identifier for this report: {identifier_label}")
 
 
+# =========================
+# GOOGLE SHEETS
+# =========================
 def get_gsheet_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -352,6 +389,72 @@ def get_gsheet_client():
     return gspread.authorize(creds)
 
 
+def get_spreadsheet():
+    gc = get_gsheet_client()
+    return gc.open_by_key(GSHEET_ID)
+
+
+def get_or_create_worksheet(title, headers, rows=1000, cols=20):
+    spreadsheet = get_spreadsheet()
+    try:
+        worksheet = spreadsheet.worksheet(title)
+    except Exception:
+        worksheet = spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
+        worksheet.append_row(headers, value_input_option="USER_ENTERED")
+
+    values = worksheet.get_all_values()
+    if not values:
+        worksheet.append_row(headers, value_input_option="USER_ENTERED")
+
+    return worksheet
+
+
+def load_sheet_as_df(title, expected_cols):
+    try:
+        worksheet = get_or_create_worksheet(title, expected_cols)
+        values = worksheet.get_all_values()
+
+        if not values or len(values) < 2:
+            return pd.DataFrame(columns=expected_cols)
+
+        headers = values[0]
+        rows = values[1:]
+
+        seen = {}
+        unique_headers = []
+        for h in headers:
+            h = str(h).strip()
+            if h in seen:
+                seen[h] += 1
+                unique_headers.append(f"{h}_{seen[h]}")
+            else:
+                seen[h] = 0
+                unique_headers.append(h)
+
+        df = pd.DataFrame(rows, columns=unique_headers)
+
+        rename_map = {}
+        for col in df.columns:
+            clean = str(col).strip()
+            for expected in expected_cols:
+                if clean.startswith(expected):
+                    rename_map[col] = expected
+                    break
+
+        df = df.rename(columns=rename_map)
+
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = None
+
+        df = df[expected_cols]
+        return df
+
+    except Exception as e:
+        st.warning(f"Could not load worksheet '{title}': {e}")
+        return pd.DataFrame(columns=expected_cols)
+
+
 def log_report_run(
     report_type,
     total_rows,
@@ -361,8 +464,7 @@ def log_report_run(
     mode,
     missing_emails
 ):
-    gc = get_gsheet_client()
-    sheet = gc.open_by_key(GSHEET_ID).worksheet("logs")
+    worksheet = get_or_create_worksheet("logs", LOG_HEADERS)
 
     new_row = [
         pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -375,10 +477,90 @@ def log_report_run(
         missing_emails
     ]
 
-    sheet.append_row(new_row, value_input_option="USER_ENTERED")
-    st.success("Run successfully logged to Google Sheets.")
+    worksheet.append_row(new_row, value_input_option="USER_ENTERED")
 
 
+def log_center_runs(report_type, summary_df, mode):
+    worksheet = get_or_create_worksheet("center_logs", CENTER_LOG_HEADERS)
+
+    rows = []
+    timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for _, row in summary_df.iterrows():
+        rows.append([
+            timestamp,
+            report_type,
+            normalize_text(row.get("CenterName", "")),
+            normalize_text(row.get("Identifier", "")),
+            int(pd.to_numeric(row.get("TotalRows", 0), errors="coerce") or 0),
+            int(pd.to_numeric(row.get("PayableY", 0), errors="coerce") or 0),
+            normalize_text(row.get("Email", "")),
+            1 if normalize_text(row.get("Email", "")) == "" else 0,
+            mode
+        ])
+
+    if rows:
+        worksheet.append_rows(rows, value_input_option="USER_ENTERED")
+
+
+def log_error_event(report_type, error_type, details, count, mode):
+    worksheet = get_or_create_worksheet("error_logs", ERROR_LOG_HEADERS)
+
+    row = [
+        pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        report_type,
+        error_type,
+        details,
+        count,
+        mode
+    ]
+
+    worksheet.append_row(row, value_input_option="USER_ENTERED")
+
+
+def load_dashboard_logs():
+    df = load_sheet_as_df("logs", LOG_HEADERS)
+
+    if "Timestamp" in df.columns:
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+
+    numeric_cols = ["TotalRows", "PayableLeads", "Centers", "EmailsSent", "MissingEmails"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    return df
+
+
+def load_center_logs():
+    df = load_sheet_as_df("center_logs", CENTER_LOG_HEADERS)
+
+    if "Timestamp" in df.columns:
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+
+    numeric_cols = ["TotalRows", "PayableLeads", "MissingEmail"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    return df
+
+
+def load_error_logs():
+    df = load_sheet_as_df("error_logs", ERROR_LOG_HEADERS)
+
+    if "Timestamp" in df.columns:
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+
+    if "Count" in df.columns:
+        df["Count"] = pd.to_numeric(df["Count"], errors="coerce").fillna(0)
+
+    return df
+
+
+# =========================
+# EMAIL
+# =========================
 def send_vendor_emails(vendor_files, sender_email, gmail_app_password, test_mode, test_email, report_name):
     server = smtplib.SMTP("smtp.gmail.com", 587)
     server.starttls()
@@ -421,6 +603,9 @@ def send_vendor_emails(vendor_files, sender_email, gmail_app_password, test_mode
     return sent_count
 
 
+# =========================
+# FILE HELPERS
+# =========================
 def get_file_extension(uploaded_file):
     name = uploaded_file.name.lower()
     if "." not in name:
@@ -437,7 +622,7 @@ def validate_uploaded_file(uploaded_file, expected_type, report_name):
                 f"{report_name} requires an Excel file (.xlsx or .xls). "
                 f"You uploaded: {uploaded_file.name}"
             )
-            st.info("Please go back and upload the original Excel workbook for this report.")
+            st.info("Please upload the original Excel workbook for this report.")
             return False
 
     if expected_type == "csv":
@@ -446,7 +631,7 @@ def validate_uploaded_file(uploaded_file, expected_type, report_name):
                 f"{report_name} requires a CSV file (.csv). "
                 f"You uploaded: {uploaded_file.name}"
             )
-            st.info("Please go back and upload the CSV export for this report.")
+            st.info("Please upload the CSV export for this report.")
             return False
 
     return True
@@ -456,12 +641,10 @@ def render_upload_instructions(report_name, expected_type):
     if expected_type == "excel":
         st.info(
             f"Upload the **{report_name} Excel workbook** in `.xlsx` or `.xls` format. "
-            "For CGM and Med Advantage, the workbook should include the required report tabs."
+            "For CGM and Med Advantage, the workbook should include the required tabs."
         )
     else:
-        st.info(
-            f"Upload the **{report_name} CSV file** in `.csv` format."
-        )
+        st.info(f"Upload the **{report_name} CSV file** in `.csv` format.")
 
 
 def render_excel_tab_requirements(report_name):
@@ -529,7 +712,7 @@ if not st.session_state.authenticated:
         )
 
         entered_password = st.text_input("Access Password", type="password")
-        login_clicked = st.button("Login", use_container_width=True)
+        login_clicked = st.button("Login", width="stretch")
 
         if login_clicked:
             if entered_password == site_password:
@@ -552,12 +735,12 @@ show_top_header()
 top_left, top_mid, top_right = st.columns([5, 1, 1])
 
 with top_mid:
-    if st.button("Dashboard", use_container_width=True):
+    if st.button("Dashboard", width="stretch"):
         st.session_state.current_page = "dashboard"
         st.rerun()
 
 with top_right:
-    if st.button("Log out", use_container_width=True):
+    if st.button("Log out", width="stretch"):
         st.session_state.authenticated = False
         st.session_state.current_page = "dashboard"
         st.rerun()
@@ -587,11 +770,32 @@ def dashboard_card(title, subtitle, button_text, page_key):
         """,
         unsafe_allow_html=True
     )
-    if st.button(button_text, key=f"btn_{page_key}", use_container_width=True):
+    if st.button(button_text, key=f"btn_{page_key}", width="stretch"):
         go_to(page_key)
 
 
+def apply_date_filter(df, option):
+    if df.empty or "Timestamp" not in df.columns:
+        return df
+
+    now = pd.Timestamp.now()
+
+    if option == "Last 7 days":
+        cutoff = now - pd.Timedelta(days=7)
+        return df[df["Timestamp"] >= cutoff]
+
+    if option == "Last 30 days":
+        cutoff = now - pd.Timedelta(days=30)
+        return df[df["Timestamp"] >= cutoff]
+
+    return df
+
+
 def render_dashboard():
+    logs_df = load_dashboard_logs()
+    center_logs_df = load_center_logs()
+    error_logs_df = load_error_logs()
+
     st.markdown(
         """
         <div style="font-size: 28px; font-weight: 800; color: #111827; margin-bottom: 6px;">
@@ -604,95 +808,126 @@ def render_dashboard():
         unsafe_allow_html=True
     )
 
-    # =========================
-    # LOAD DATA
-    # =========================
-    logs_df = load_dashboard_logs()
+    filter_col1, filter_col2 = st.columns([1, 4])
+    with filter_col1:
+        date_filter = st.selectbox(
+            "Date Range",
+            ["All time", "Last 7 days", "Last 30 days"],
+            index=0
+        )
 
-    if logs_df.empty:
-        st.info("No report runs yet. Upload and send a report to start tracking stats.")
-    else:
-        # =========================
-        # KPIs
-        # =========================
-        total_runs = len(logs_df)
-        total_leads = int(logs_df["TotalRows"].sum())
-        total_payable = int(logs_df["PayableLeads"].sum())
-        total_emails = int(logs_df["EmailsSent"].sum())
+    logs_filtered = apply_date_filter(logs_df, date_filter)
+    center_logs_filtered = apply_date_filter(center_logs_df, date_filter)
+    error_logs_filtered = apply_date_filter(error_logs_df, date_filter)
 
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            metric_card("Total Runs", total_runs)
-        with m2:
-            metric_card("Total Leads", total_leads)
-        with m3:
-            metric_card("Payable Leads", total_payable)
-        with m4:
-            metric_card("Emails Sent", total_emails)
+    total_runs = int(len(logs_filtered)) if not logs_filtered.empty else 0
+    total_emails = int(logs_filtered["EmailsSent"].sum()) if "EmailsSent" in logs_filtered.columns and not logs_filtered.empty else 0
+    total_payable = int(logs_filtered["PayableLeads"].sum()) if "PayableLeads" in logs_filtered.columns and not logs_filtered.empty else 0
+    total_leads = int(logs_filtered["TotalRows"].sum()) if "TotalRows" in logs_filtered.columns and not logs_filtered.empty else 0
+    conversion_rate = f"{(total_payable / total_leads * 100):.1f}%" if total_leads > 0 else "0.0%"
+    total_missing_emails = int(logs_filtered["MissingEmails"].sum()) if "MissingEmails" in logs_filtered.columns and not logs_filtered.empty else 0
 
-        st.markdown("### 📊 Activity Over Time")
+    last_run = "N/A"
+    if "Timestamp" in logs_filtered.columns and not logs_filtered.empty and logs_filtered["Timestamp"].notna().any():
+        last_run = logs_filtered["Timestamp"].max().strftime("%Y-%m-%d %H:%M")
 
-        # =========================
-        # DAILY TREND
-        # =========================
-        logs_df["Date"] = logs_df["Timestamp"].dt.date
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1:
+        metric_card("Total Runs", total_runs)
+    with m2:
+        metric_card("Total Leads", total_leads)
+    with m3:
+        metric_card("Payable Leads", total_payable)
+    with m4:
+        metric_card("Conversion Rate", conversion_rate)
+    with m5:
+        metric_card("Emails Sent", total_emails)
+    with m6:
+        metric_card("Last Run", last_run)
 
-        daily = logs_df.groupby("Date").agg({
-            "TotalRows": "sum",
-            "PayableLeads": "sum",
-            "EmailsSent": "sum"
-        }).reset_index()
-
-        st.line_chart(daily.set_index("Date"))
-
-        # =========================
-        # REPORT TYPE BREAKDOWN
-        # =========================
-        st.markdown("### 📂 Report Breakdown")
-
-        report_breakdown = logs_df.groupby("ReportType").agg({
-            "TotalRows": "sum",
-            "PayableLeads": "sum",
-            "EmailsSent": "sum"
-        }).reset_index()
-
-        st.dataframe(report_breakdown, use_container_width=True)
-
-        # =========================
-        # MODE SPLIT
-        # =========================
-        st.markdown("### 🧪 Test vs Live")
-
-        mode_counts = logs_df["Mode"].value_counts()
-        st.bar_chart(mode_counts)
-
-    # =========================
-    # NAVIGATION (keep this)
-    # =========================
     st.markdown("### Report Workflows")
-
     c1, c2, c3 = st.columns(3)
     with c1:
         dashboard_card(
             "CGM Report",
-            "Upload Excel, split, map, and send.",
+            "Upload daily Excel workbook, split by LeadSource, manage mappings, and email vendor files.",
             "Open CGM Report",
             "cgm"
         )
     with c2:
         dashboard_card(
             "ECP Report",
-            "CSV upload with payable logic.",
+            "Upload CSV, calculate Payable using Transfer Sale + Duration >= 120, split by Sub Id, and email vendor files.",
             "Open ECP Report",
             "ecp"
         )
     with c3:
         dashboard_card(
             "Med Advantage Report",
-            "Excel processing with column filtering.",
+            "Upload Excel workbook, split by LeadSource, keep columns N and O, remove columns K/L/M, and email vendor files.",
             "Open Med Advantage Report",
             "medadv"
         )
+
+    if logs_filtered.empty:
+        st.info("No dashboard history found yet for this date range. Send at least one report to populate analytics.")
+        return
+
+    st.markdown("### Activity Over Time")
+    trend_df = logs_filtered.copy()
+    trend_df["Date"] = trend_df["Timestamp"].dt.date
+    daily = trend_df.groupby("Date")[["TotalRows", "PayableLeads", "EmailsSent"]].sum()
+    st.line_chart(daily)
+
+    chart_col1, chart_col2 = st.columns(2)
+
+    with chart_col1:
+        st.markdown("### Runs by Report Type")
+        runs_by_report = logs_filtered.groupby("ReportType").size()
+        st.bar_chart(runs_by_report)
+
+    with chart_col2:
+        st.markdown("### Emails Sent by Report")
+        emails_by_report = logs_filtered.groupby("ReportType")["EmailsSent"].sum()
+        st.bar_chart(emails_by_report)
+
+    st.markdown("### Top Performing Centers")
+    if center_logs_filtered.empty:
+        st.info("No center-level history available yet.")
+    else:
+        top_centers = (
+            center_logs_filtered.groupby("CenterName")[["TotalRows", "PayableLeads"]]
+            .sum()
+            .reset_index()
+            .sort_values(by=["PayableLeads", "TotalRows"], ascending=False)
+            .head(10)
+        )
+        st.dataframe(top_centers, width="stretch")
+
+    st.markdown("### Error Tracking")
+    err1, err2, err3 = st.columns(3)
+    with err1:
+        metric_card("Missing Emails", total_missing_emails)
+    with err2:
+        recent_error_count = int(error_logs_filtered["Count"].sum()) if not error_logs_filtered.empty and "Count" in error_logs_filtered.columns else 0
+        metric_card("Logged Errors", recent_error_count)
+    with err3:
+        live_runs = int((logs_filtered["Mode"] == "LIVE").sum()) if "Mode" in logs_filtered.columns and not logs_filtered.empty else 0
+        metric_card("Live Runs", live_runs)
+
+    if not error_logs_filtered.empty:
+        st.markdown("### Recent Errors")
+        recent_errors = error_logs_filtered.sort_values(by="Timestamp", ascending=False).head(10)
+        st.dataframe(recent_errors, width="stretch")
+
+    st.markdown("### Recent Activity")
+    recent_cols = [
+        col for col in ["Timestamp", "ReportType", "TotalRows", "PayableLeads", "Centers", "EmailsSent", "Mode", "MissingEmails"]
+        if col in logs_filtered.columns
+    ]
+    recent_df = logs_filtered.sort_values(by="Timestamp", ascending=False).head(10)[recent_cols]
+    st.dataframe(recent_df, width="stretch")
+
 
 # =========================
 # REPORT PAGES
@@ -701,7 +936,7 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
     back_col, title_col = st.columns([1, 6])
 
     with back_col:
-        if st.button("← Back", key=f"back_{report_key}", use_container_width=True):
+        if st.button("← Back", key=f"back_{report_key}", width="stretch"):
             go_to("dashboard")
 
     with title_col:
@@ -958,8 +1193,9 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
             total_rows = int(summary_df["TotalRows"].sum()) if not summary_df.empty else 0
             total_payable = int(summary_df["PayableY"].sum()) if not summary_df.empty else 0
             ready_count = int((summary_df["ReadyToSend"] == "Yes").sum()) if not summary_df.empty else 0
+            conversion_rate = f"{(total_payable / total_rows * 100):.1f}%" if total_rows > 0 else "0.0%"
 
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             with m1:
                 metric_card("Centers", total_centers)
             with m2:
@@ -967,6 +1203,8 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
             with m3:
                 metric_card("Payable Leads", total_payable)
             with m4:
+                metric_card("Conversion Rate", conversion_rate)
+            with m5:
                 metric_card("Ready to Send", ready_count)
 
             tab1, tab2, tab3, tab4 = st.tabs(["Review", "Downloads", "Email Queue", "Raw Preview"])
@@ -990,14 +1228,14 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                     data=zip_buffer,
                     file_name=f"{report_key}_split_reports.zip",
                     mime="application/zip",
-                    use_container_width=True
+                    width="stretch"
                 )
                 st.download_button(
                     label="Download center summary CSV",
                     data=summary_df.to_csv(index=False).encode("utf-8"),
                     file_name=f"{report_key}_center_summary.csv",
                     mime="text/csv",
-                    use_container_width=True
+                    width="stretch"
                 )
 
             with tab3:
@@ -1034,7 +1272,7 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                     send_disabled = True
                     st.warning("Live sending requires confirmation before emails can be sent.")
 
-                if st.button("Send Emails", key=f"{report_key}_send_emails", type="primary", use_container_width=True, disabled=send_disabled):
+                if st.button("Send Emails", key=f"{report_key}_send_emails", type="primary", width="stretch", disabled=send_disabled):
                     try:
                         sent_count = send_vendor_emails(
                             vendor_files=vendor_files,
@@ -1047,6 +1285,8 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
 
                         st.success(f"Sent {sent_count} emails successfully.")
 
+                        mode_value = "TEST" if test_mode else "LIVE"
+
                         try:
                             log_report_run(
                                 report_type=report_name,
@@ -1054,13 +1294,41 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                                 payable_leads=total_payable,
                                 centers=total_centers,
                                 emails_sent=sent_count,
-                                mode="TEST" if test_mode else "LIVE",
+                                mode=mode_value,
                                 missing_emails=len(missing_email_df)
                             )
+
+                            log_center_runs(
+                                report_type=report_name,
+                                summary_df=summary_df,
+                                mode=mode_value
+                            )
+
+                            if len(missing_email_df) > 0:
+                                log_error_event(
+                                    report_type=report_name,
+                                    error_type="Missing Emails",
+                                    details=f"{len(missing_email_df)} centers missing emails",
+                                    count=len(missing_email_df),
+                                    mode=mode_value
+                                )
+
+                            st.rerun()
+
                         except Exception as log_error:
-                            st.warning(f"Run completed, but log could not be written to Google Sheets: {log_error}")
+                            st.warning(f"Run completed, but dashboard logging could not be written to Google Sheets: {log_error}")
 
                     except Exception as e:
+                        try:
+                            log_error_event(
+                                report_type=report_name,
+                                error_type="Email Send Failure",
+                                details=str(e),
+                                count=1,
+                                mode="TEST" if test_mode else "LIVE"
+                            )
+                        except Exception:
+                            pass
                         st.error(f"Email error: {e}")
 
             with tab4:
