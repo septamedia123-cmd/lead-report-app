@@ -1,8 +1,6 @@
 import io
 import smtplib
 import zipfile
-from datetime import datetime, timedelta
-
 import pandas as pd
 import streamlit as st
 import gspread
@@ -18,8 +16,6 @@ st.set_page_config(
 CC_EMAIL = "erica@livmed.us"
 LOGO_FILE = "logo-fixed.png"
 GSHEET_ID = st.secrets["GSHEET_ID"]
-
-MAPPING_COLUMNS = ["Identifier", "CenterName", "Email", "Active", "Notes"]
 
 LOG_HEADERS = [
     "Timestamp",
@@ -53,6 +49,30 @@ ERROR_LOG_HEADERS = [
     "Mode"
 ]
 
+CENTER_PROFILE_HEADERS = [
+    "CenterName",
+    "Country",
+    "Address",
+    "Phone",
+    "ContactPerson",
+    "CommunicationPreference",
+    "TeamEmail",
+    "Campaign",
+    "PaymentSource",
+    "PaymentEmail",
+    "PaymentDetails",
+    "CGMIdentifier",
+    "CGMDID",
+    "ECPIdentifier",
+    "ECPDID",
+    "BGMIdentifier",
+    "BGMDID",
+    "MAIdentifier",
+    "MADID",
+    "Notes",
+    "Active"
+]
+
 
 # =========================
 # HELPERS
@@ -61,6 +81,10 @@ def normalize_text(value):
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def normalize_identifier(value):
+    return normalize_text(value)
 
 
 def find_column(df, candidates):
@@ -112,51 +136,17 @@ Dean
 """
 
 
-def empty_mapping_df():
-    return pd.DataFrame(columns=MAPPING_COLUMNS)
-
-
-def ensure_mapping_state(report_key):
-    state_key = f"{report_key}_mapping"
-    if state_key not in st.session_state:
-        st.session_state[state_key] = empty_mapping_df()
-
-
-def get_mapping_df(report_key):
-    ensure_mapping_state(report_key)
-    df = st.session_state[f"{report_key}_mapping"].copy()
-    for col in MAPPING_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-    return df[MAPPING_COLUMNS].fillna("")
-
-
-def set_mapping_df(report_key, df):
-    clean = df.copy()
-    for col in MAPPING_COLUMNS:
-        if col not in clean.columns:
-            clean[col] = ""
-    clean = clean[MAPPING_COLUMNS].fillna("")
-    clean["Identifier"] = clean["Identifier"].apply(normalize_text)
-    clean["CenterName"] = clean["CenterName"].apply(normalize_text)
-    clean["Email"] = clean["Email"].apply(normalize_text)
-    clean["Active"] = clean["Active"].apply(normalize_text)
-    clean["Notes"] = clean["Notes"].apply(normalize_text)
-    clean = clean.drop_duplicates(subset=["Identifier"])
-    st.session_state[f"{report_key}_mapping"] = clean
-
-
 def metric_card(label, value):
     st.markdown(
         f"""
         <div style="
-            background: white;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
             border: 1px solid #e5e7eb;
-            border-radius: 14px;
+            border-radius: 16px;
             padding: 18px 16px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
-            <div style="font-size: 13px; color: #6b7280; font-weight: 600;">{label}</div>
-            <div style="font-size: 28px; color: #111827; font-weight: 800; margin-top: 6px;">{value}</div>
+            box-shadow: 0 4px 14px rgba(0,0,0,0.05);">
+            <div style="font-size: 12px; color: #6b7280; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;">{label}</div>
+            <div style="font-size: 28px; color: #111827; font-weight: 800; margin-top: 8px;">{value}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -214,7 +204,7 @@ def show_top_header():
                     LIVMED Report Portal
                 </div>
                 <div style="font-size: 16px; color: #6b7280; margin-top: 4px;">
-                    Secure report processing, file splitting, mapping management, and vendor delivery
+                    Secure report processing, center profiles, file splitting, and vendor delivery
                 </div>
             </div>
             """,
@@ -224,153 +214,26 @@ def show_top_header():
     st.markdown("<hr style='margin-top: 10px; margin-bottom: 20px;'>", unsafe_allow_html=True)
 
 
-def merge_with_mapping(base_df, identifier_col, mapping_df, workbook_lookup=None):
-    base = base_df.copy()
-    base["Identifier_normalized"] = base[identifier_col].apply(normalize_text)
-
-    if workbook_lookup is None:
-        workbook_lookup = pd.DataFrame(columns=["Identifier", "CenterName", "Email"])
-
-    if workbook_lookup.empty:
-        workbook_lookup = pd.DataFrame(columns=["Identifier", "CenterName", "Email"])
-
-    workbook_lookup = workbook_lookup.copy()
-    if not workbook_lookup.empty:
-        workbook_lookup["Identifier"] = workbook_lookup["Identifier"].apply(normalize_text)
-        workbook_lookup["CenterName"] = workbook_lookup["CenterName"].apply(normalize_text)
-        workbook_lookup["Email"] = workbook_lookup["Email"].apply(normalize_text)
-        workbook_lookup = workbook_lookup.drop_duplicates(subset=["Identifier"])
-
-    mapping_df = mapping_df.copy()
-    if not mapping_df.empty:
-        mapping_df["Identifier"] = mapping_df["Identifier"].apply(normalize_text)
-        mapping_df["CenterName"] = mapping_df["CenterName"].apply(normalize_text)
-        mapping_df["Email"] = mapping_df["Email"].apply(normalize_text)
-        mapping_df = mapping_df.drop_duplicates(subset=["Identifier"])
-
-    merged = base.merge(
-        workbook_lookup[["Identifier", "CenterName", "Email"]] if not workbook_lookup.empty else pd.DataFrame(columns=["Identifier", "CenterName", "Email"]),
-        left_on="Identifier_normalized",
-        right_on="Identifier",
-        how="left"
-    )
-
-    merged = merged.merge(
-        mapping_df[["Identifier", "CenterName", "Email"]] if not mapping_df.empty else pd.DataFrame(columns=["Identifier", "CenterName", "Email"]),
-        left_on="Identifier_normalized",
-        right_on="Identifier",
-        how="left",
-        suffixes=("_workbook", "_mapping")
-    )
-
-    workbook_center_col = "CenterName_workbook" if "CenterName_workbook" in merged.columns else "CenterName"
-    workbook_email_col = "Email_workbook" if "Email_workbook" in merged.columns else "Email"
-    mapping_center_col = "CenterName_mapping" if "CenterName_mapping" in merged.columns else None
-    mapping_email_col = "Email_mapping" if "Email_mapping" in merged.columns else None
-
-    merged["FinalCenterName"] = merged[workbook_center_col] if workbook_center_col in merged.columns else ""
-    merged["FinalEmail"] = merged[workbook_email_col] if workbook_email_col in merged.columns else ""
-
-    if mapping_center_col and mapping_center_col in merged.columns:
-        merged["FinalCenterName"] = merged[mapping_center_col].where(
-            merged[mapping_center_col].astype(str).str.strip() != "",
-            merged["FinalCenterName"]
-        )
-
-    if mapping_email_col and mapping_email_col in merged.columns:
-        merged["FinalEmail"] = merged[mapping_email_col].where(
-            merged[mapping_email_col].astype(str).str.strip() != "",
-            merged["FinalEmail"]
-        )
-
-    merged["FinalCenterName"] = merged["FinalCenterName"].fillna("").apply(normalize_text)
-    merged["FinalEmail"] = merged["FinalEmail"].fillna("").apply(normalize_text)
-
-    return merged
+def go_to(page_name):
+    st.session_state.current_page = page_name
+    st.rerun()
 
 
-def build_workbook_lookup(conversion_df):
-    if conversion_df is None or conversion_df.empty:
-        return pd.DataFrame(columns=["Identifier", "CenterName", "Email"])
+def apply_date_filter(df, option):
+    if df.empty or "Timestamp" not in df.columns:
+        return df
 
-    identifier_col = conversion_df.columns[0]
-    center_name_col = find_column(conversion_df, ["Center Name", "CenterName"])
-    email_col = find_column(conversion_df, ["Email", "Email Address"])
+    now = pd.Timestamp.now()
 
-    lookup = pd.DataFrame({
-        "Identifier": conversion_df[identifier_col].apply(normalize_text),
-        "CenterName": conversion_df[center_name_col].apply(normalize_text) if center_name_col else "",
-        "Email": conversion_df[email_col].apply(normalize_text) if email_col else "",
-    })
+    if option == "Last 7 days":
+        cutoff = now - pd.Timedelta(days=7)
+        return df[df["Timestamp"] >= cutoff]
 
-    lookup = lookup.drop_duplicates(subset=["Identifier"])
-    lookup = lookup[lookup["Identifier"] != ""]
-    return lookup
+    if option == "Last 30 days":
+        cutoff = now - pd.Timedelta(days=30)
+        return df[df["Timestamp"] >= cutoff]
 
-
-def render_mapping_manager(report_key, report_name, identifier_label):
-    st.subheader(f"{report_name} Mappings")
-    st.info(
-        "Use this mapping table to manage identifiers, center names, and email addresses. "
-        "Download the CSV after editing to keep a backup."
-    )
-
-    uploaded_mapping = st.file_uploader(
-        f"Upload {report_name} mapping CSV",
-        type=["csv"],
-        key=f"{report_key}_mapping_upload"
-    )
-
-    if uploaded_mapping is not None:
-        try:
-            uploaded_df = pd.read_csv(uploaded_mapping)
-            rename_map = {}
-            for col in uploaded_df.columns:
-                col_lower = str(col).strip().lower()
-                if col_lower in ["subid", "sub id", "leadsource", "lead source", "identifier"]:
-                    rename_map[col] = "Identifier"
-                elif col_lower in ["centername", "center name"]:
-                    rename_map[col] = "CenterName"
-                elif col_lower in ["email", "email address"]:
-                    rename_map[col] = "Email"
-                elif col_lower == "active":
-                    rename_map[col] = "Active"
-                elif col_lower == "notes":
-                    rename_map[col] = "Notes"
-
-            uploaded_df = uploaded_df.rename(columns=rename_map)
-            for col in MAPPING_COLUMNS:
-                if col not in uploaded_df.columns:
-                    uploaded_df[col] = ""
-            set_mapping_df(report_key, uploaded_df[MAPPING_COLUMNS])
-            st.success("Mapping file loaded into the app.")
-        except Exception as e:
-            st.error(f"Could not load mapping file: {e}")
-
-    mapping_df = get_mapping_df(report_key)
-
-    edited_df = st.data_editor(
-        mapping_df,
-        width="stretch",
-        num_rows="dynamic",
-        key=f"{report_key}_editor"
-    )
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button(f"Save {report_name} Mapping Changes", key=f"{report_key}_save_mapping", width="stretch"):
-            set_mapping_df(report_key, edited_df)
-            st.success("Mapping changes saved.")
-    with c2:
-        st.download_button(
-            label=f"Download {report_name} Mapping CSV",
-            data=edited_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{report_key}_mapping.csv",
-            mime="text/csv",
-            width="stretch"
-        )
-
-    st.caption(f"Identifier for this report: {identifier_label}")
+    return df
 
 
 # =========================
@@ -381,7 +244,6 @@ def get_gsheet_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
-
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
         scopes=scopes
@@ -394,7 +256,7 @@ def get_spreadsheet():
     return gc.open_by_key(GSHEET_ID)
 
 
-def get_or_create_worksheet(title, headers, rows=1000, cols=20):
+def get_or_create_worksheet(title, headers, rows=1000, cols=40):
     spreadsheet = get_spreadsheet()
     try:
         worksheet = spreadsheet.worksheet(title)
@@ -445,28 +307,32 @@ def load_sheet_as_df(title, expected_cols):
 
         for col in expected_cols:
             if col not in df.columns:
-                df[col] = None
+                df[col] = ""
 
-        df = df[expected_cols]
-        return df
+        return df[expected_cols]
 
     except Exception as e:
         st.warning(f"Could not load worksheet '{title}': {e}")
         return pd.DataFrame(columns=expected_cols)
 
 
-def log_report_run(
-    report_type,
-    total_rows,
-    payable_leads,
-    centers,
-    emails_sent,
-    mode,
-    missing_emails
-):
-    worksheet = get_or_create_worksheet("logs", LOG_HEADERS)
+def write_dataframe_to_sheet(title, df, headers):
+    worksheet = get_or_create_worksheet(title, headers)
 
-    new_row = [
+    clean = df.copy()
+    for col in headers:
+        if col not in clean.columns:
+            clean[col] = ""
+    clean = clean[headers].fillna("")
+
+    worksheet.clear()
+    data = [headers] + clean.astype(str).values.tolist()
+    worksheet.update(data, value_input_option="USER_ENTERED")
+
+
+def log_report_run(report_type, total_rows, payable_leads, centers, emails_sent, mode, missing_emails):
+    worksheet = get_or_create_worksheet("logs", LOG_HEADERS)
+    row = [
         pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         report_type,
         total_rows,
@@ -476,19 +342,17 @@ def log_report_run(
         mode,
         missing_emails
     ]
-
-    worksheet.append_row(new_row, value_input_option="USER_ENTERED")
+    worksheet.append_row(row, value_input_option="USER_ENTERED")
 
 
 def log_center_runs(report_type, summary_df, mode):
     worksheet = get_or_create_worksheet("center_logs", CENTER_LOG_HEADERS)
-
     rows = []
-    timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for _, row in summary_df.iterrows():
         rows.append([
-            timestamp,
+            ts,
             report_type,
             normalize_text(row.get("CenterName", "")),
             normalize_text(row.get("Identifier", "")),
@@ -505,7 +369,6 @@ def log_center_runs(report_type, summary_df, mode):
 
 def log_error_event(report_type, error_type, details, count, mode):
     worksheet = get_or_create_worksheet("error_logs", ERROR_LOG_HEADERS)
-
     row = [
         pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         report_type,
@@ -514,52 +377,98 @@ def log_error_event(report_type, error_type, details, count, mode):
         count,
         mode
     ]
-
     worksheet.append_row(row, value_input_option="USER_ENTERED")
 
 
 def load_dashboard_logs():
     df = load_sheet_as_df("logs", LOG_HEADERS)
-
     if "Timestamp" in df.columns:
         df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-
-    numeric_cols = ["TotalRows", "PayableLeads", "Centers", "EmailsSent", "MissingEmails"]
-    for col in numeric_cols:
+    for col in ["TotalRows", "PayableLeads", "Centers", "EmailsSent", "MissingEmails"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
     return df
 
 
 def load_center_logs():
     df = load_sheet_as_df("center_logs", CENTER_LOG_HEADERS)
-
     if "Timestamp" in df.columns:
         df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-
-    numeric_cols = ["TotalRows", "PayableLeads", "MissingEmail"]
-    for col in numeric_cols:
+    for col in ["TotalRows", "PayableLeads", "MissingEmail"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
     return df
 
 
 def load_error_logs():
     df = load_sheet_as_df("error_logs", ERROR_LOG_HEADERS)
-
     if "Timestamp" in df.columns:
         df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-
     if "Count" in df.columns:
         df["Count"] = pd.to_numeric(df["Count"], errors="coerce").fillna(0)
-
     return df
 
 
+def load_center_profiles():
+    df = load_sheet_as_df("center_profiles", CENTER_PROFILE_HEADERS)
+    for col in CENTER_PROFILE_HEADERS:
+        if col in df.columns:
+            df[col] = df[col].apply(normalize_text)
+    return df
+
+
+def save_center_profiles(df):
+    write_dataframe_to_sheet("center_profiles", df, CENTER_PROFILE_HEADERS)
+
+
 # =========================
-# EMAIL
+# CENTER PROFILE LOOKUPS
+# =========================
+def build_profile_lookup(profiles_df, id_col_name):
+    if profiles_df.empty or id_col_name not in profiles_df.columns:
+        return pd.DataFrame(columns=["Identifier", "CenterName", "Email", "ProfileNotes", "ContactPerson"])
+
+    lookup = pd.DataFrame({
+        "Identifier": profiles_df[id_col_name].apply(normalize_identifier),
+        "CenterName": profiles_df["CenterName"].apply(normalize_text) if "CenterName" in profiles_df.columns else "",
+        "Email": profiles_df["TeamEmail"].apply(normalize_text) if "TeamEmail" in profiles_df.columns else "",
+        "ProfileNotes": profiles_df["Notes"].apply(normalize_text) if "Notes" in profiles_df.columns else "",
+        "ContactPerson": profiles_df["ContactPerson"].apply(normalize_text) if "ContactPerson" in profiles_df.columns else "",
+    })
+
+    lookup = lookup[lookup["Identifier"] != ""]
+    lookup = lookup.drop_duplicates(subset=["Identifier"])
+    return lookup
+
+
+def merge_with_profile_lookup(base_df, identifier_col, profile_lookup):
+    base = base_df.copy()
+    base["Identifier_normalized"] = base[identifier_col].apply(normalize_identifier)
+
+    if profile_lookup is None or profile_lookup.empty:
+        base["FinalCenterName"] = ""
+        base["FinalEmail"] = ""
+        base["ProfileNotes"] = ""
+        base["ContactPerson"] = ""
+        return base
+
+    merged = base.merge(
+        profile_lookup,
+        left_on="Identifier_normalized",
+        right_on="Identifier",
+        how="left"
+    )
+
+    merged["FinalCenterName"] = merged["CenterName"].fillna("").apply(normalize_text)
+    merged["FinalEmail"] = merged["Email"].fillna("").apply(normalize_text)
+    merged["ProfileNotes"] = merged["ProfileNotes"].fillna("").apply(normalize_text)
+    merged["ContactPerson"] = merged["ContactPerson"].fillna("").apply(normalize_text)
+
+    return merged
+
+
+# =========================
+# FILE / EMAIL HELPERS
 # =========================
 def send_vendor_emails(vendor_files, sender_email, gmail_app_password, test_mode, test_email, report_name):
     server = smtplib.SMTP("smtp.gmail.com", 587)
@@ -603,9 +512,6 @@ def send_vendor_emails(vendor_files, sender_email, gmail_app_password, test_mode
     return sent_count
 
 
-# =========================
-# FILE HELPERS
-# =========================
 def get_file_extension(uploaded_file):
     name = uploaded_file.name.lower()
     if "." not in name:
@@ -616,23 +522,15 @@ def get_file_extension(uploaded_file):
 def validate_uploaded_file(uploaded_file, expected_type, report_name):
     ext = get_file_extension(uploaded_file)
 
-    if expected_type == "excel":
-        if ext not in ["xlsx", "xls"]:
-            st.error(
-                f"{report_name} requires an Excel file (.xlsx or .xls). "
-                f"You uploaded: {uploaded_file.name}"
-            )
-            st.info("Please upload the original Excel workbook for this report.")
-            return False
+    if expected_type == "excel" and ext not in ["xlsx", "xls"]:
+        st.error(f"{report_name} requires an Excel file (.xlsx or .xls). You uploaded: {uploaded_file.name}")
+        st.info("Please upload the original Excel workbook for this report.")
+        return False
 
-    if expected_type == "csv":
-        if ext != "csv":
-            st.error(
-                f"{report_name} requires a CSV file (.csv). "
-                f"You uploaded: {uploaded_file.name}"
-            )
-            st.info("Please upload the CSV export for this report.")
-            return False
+    if expected_type == "csv" and ext != "csv":
+        st.error(f"{report_name} requires a CSV file (.csv). You uploaded: {uploaded_file.name}")
+        st.info("Please upload the CSV export for this report.")
+        return False
 
     return True
 
@@ -653,117 +551,18 @@ def render_excel_tab_requirements(report_name):
 
 
 # =========================
-# SESSION + SECRETS
+# DASHBOARD / UI
 # =========================
-sender_email = st.secrets["EMAIL"]
-gmail_app_password = st.secrets["PASSWORD"]
-site_password = st.secrets["APP_PASSWORD"]
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if "current_page" not in st.session_state:
-    st.session_state.current_page = "dashboard"
-
-for key in ["cgm", "ecp", "medadv"]:
-    ensure_mapping_state(key)
-
-
-# =========================
-# LOGIN SCREEN
-# =========================
-if not st.session_state.authenticated:
-    st.markdown(
-        """
-        <style>
-        .stApp {
-            background: linear-gradient(180deg, #020617 0%, #0f172a 100%);
-        }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-
-    with col2:
-        st.markdown(
-            """
-            <div style="
-                text-align: center;
-                padding-top: 60px;
-                padding-bottom: 20px;">
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.image(LOGO_FILE, width=260)
-
-        st.markdown(
-            """
-            <div style="font-size: 30px; font-weight: 800; color: white; margin-top: 12px;">
-                LIVMED Report Portal
-            </div>
-            <div style="font-size: 15px; color: #cbd5e1; margin-top: 8px; margin-bottom: 20px;">
-                Secure access required
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        entered_password = st.text_input("Access Password", type="password")
-        login_clicked = st.button("Login", width="stretch")
-
-        if login_clicked:
-            if entered_password == site_password:
-                st.session_state.authenticated = True
-                st.session_state.current_page = "dashboard"
-                st.rerun()
-            else:
-                st.error("Incorrect password.")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.stop()
-
-
-# =========================
-# MAIN HEADER
-# =========================
-show_top_header()
-
-top_left, top_mid, top_right = st.columns([5, 1, 1])
-
-with top_mid:
-    if st.button("Dashboard", width="stretch"):
-        st.session_state.current_page = "dashboard"
-        st.rerun()
-
-with top_right:
-    if st.button("Log out", width="stretch"):
-        st.session_state.authenticated = False
-        st.session_state.current_page = "dashboard"
-        st.rerun()
-
-
-# =========================
-# DASHBOARD
-# =========================
-def go_to(page_name):
-    st.session_state.current_page = page_name
-    st.rerun()
-
-
 def dashboard_card(title, subtitle, button_text, page_key):
     st.markdown(
         f"""
         <div style="
-            background: white;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
             border: 1px solid #e5e7eb;
             border-radius: 18px;
             padding: 24px;
             min-height: 180px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.04);">
+            box-shadow: 0 6px 18px rgba(0,0,0,0.05);">
             <div style="font-size: 22px; font-weight: 800; color: #111827;">{title}</div>
             <div style="font-size: 14px; color: #6b7280; margin-top: 8px;">{subtitle}</div>
         </div>
@@ -772,23 +571,6 @@ def dashboard_card(title, subtitle, button_text, page_key):
     )
     if st.button(button_text, key=f"btn_{page_key}", width="stretch"):
         go_to(page_key)
-
-
-def apply_date_filter(df, option):
-    if df.empty or "Timestamp" not in df.columns:
-        return df
-
-    now = pd.Timestamp.now()
-
-    if option == "Last 7 days":
-        cutoff = now - pd.Timedelta(days=7)
-        return df[df["Timestamp"] >= cutoff]
-
-    if option == "Last 30 days":
-        cutoff = now - pd.Timedelta(days=30)
-        return df[df["Timestamp"] >= cutoff]
-
-    return df
 
 
 def render_dashboard():
@@ -808,27 +590,22 @@ def render_dashboard():
         unsafe_allow_html=True
     )
 
-    filter_col1, filter_col2 = st.columns([1, 4])
+    filter_col1, _ = st.columns([1, 5])
     with filter_col1:
-        date_filter = st.selectbox(
-            "Date Range",
-            ["All time", "Last 7 days", "Last 30 days"],
-            index=0
-        )
+        date_filter = st.selectbox("Date Range", ["All time", "Last 7 days", "Last 30 days"], index=0)
 
     logs_filtered = apply_date_filter(logs_df, date_filter)
     center_logs_filtered = apply_date_filter(center_logs_df, date_filter)
     error_logs_filtered = apply_date_filter(error_logs_df, date_filter)
 
     total_runs = int(len(logs_filtered)) if not logs_filtered.empty else 0
-    total_emails = int(logs_filtered["EmailsSent"].sum()) if "EmailsSent" in logs_filtered.columns and not logs_filtered.empty else 0
-    total_payable = int(logs_filtered["PayableLeads"].sum()) if "PayableLeads" in logs_filtered.columns and not logs_filtered.empty else 0
-    total_leads = int(logs_filtered["TotalRows"].sum()) if "TotalRows" in logs_filtered.columns and not logs_filtered.empty else 0
+    total_emails = int(logs_filtered["EmailsSent"].sum()) if not logs_filtered.empty else 0
+    total_payable = int(logs_filtered["PayableLeads"].sum()) if not logs_filtered.empty else 0
+    total_leads = int(logs_filtered["TotalRows"].sum()) if not logs_filtered.empty else 0
+    total_missing_emails = int(logs_filtered["MissingEmails"].sum()) if not logs_filtered.empty else 0
     conversion_rate = f"{(total_payable / total_leads * 100):.1f}%" if total_leads > 0 else "0.0%"
-    total_missing_emails = int(logs_filtered["MissingEmails"].sum()) if "MissingEmails" in logs_filtered.columns and not logs_filtered.empty else 0
-
     last_run = "N/A"
-    if "Timestamp" in logs_filtered.columns and not logs_filtered.empty and logs_filtered["Timestamp"].notna().any():
+    if not logs_filtered.empty and logs_filtered["Timestamp"].notna().any():
         last_run = logs_filtered["Timestamp"].max().strftime("%Y-%m-%d %H:%M")
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -845,29 +622,16 @@ def render_dashboard():
     with m6:
         metric_card("Last Run", last_run)
 
-    st.markdown("### Report Workflows")
-    c1, c2, c3 = st.columns(3)
+    st.markdown("### Workflows")
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        dashboard_card(
-            "CGM Report",
-            "Upload daily Excel workbook, split by LeadSource, manage mappings, and email vendor files.",
-            "Open CGM Report",
-            "cgm"
-        )
+        dashboard_card("CGM Report", "Upload Excel, split by LeadSource, and send vendor files.", "Open CGM", "cgm")
     with c2:
-        dashboard_card(
-            "ECP Report",
-            "Upload CSV, calculate Payable using Transfer Sale + Duration >= 120, split by Sub Id, and email vendor files.",
-            "Open ECP Report",
-            "ecp"
-        )
+        dashboard_card("ECP Report", "Upload CSV, calculate payable, split by Sub Id, and send.", "Open ECP", "ecp")
     with c3:
-        dashboard_card(
-            "Med Advantage Report",
-            "Upload Excel workbook, split by LeadSource, keep columns N and O, remove columns K/L/M, and email vendor files.",
-            "Open Med Advantage Report",
-            "medadv"
-        )
+        dashboard_card("Med Advantage", "Upload Excel, split by LeadSource, and send vendor files.", "Open Med Adv", "medadv")
+    with c4:
+        dashboard_card("Center Profiles", "Manage master center cards, identifiers, contact info, and notes.", "Open Profiles", "profiles")
 
     if logs_filtered.empty:
         st.info("No dashboard history found yet for this date range. Send at least one report to populate analytics.")
@@ -877,19 +641,17 @@ def render_dashboard():
     trend_df = logs_filtered.copy()
     trend_df["Date"] = trend_df["Timestamp"].dt.date
     daily = trend_df.groupby("Date")[["TotalRows", "PayableLeads", "EmailsSent"]].sum()
-    st.line_chart(daily)
+    st.line_chart(daily, width="stretch")
 
-    chart_col1, chart_col2 = st.columns(2)
-
-    with chart_col1:
+    ch1, ch2 = st.columns(2)
+    with ch1:
         st.markdown("### Runs by Report Type")
         runs_by_report = logs_filtered.groupby("ReportType").size()
-        st.bar_chart(runs_by_report)
-
-    with chart_col2:
+        st.bar_chart(runs_by_report, width="stretch")
+    with ch2:
         st.markdown("### Emails Sent by Report")
         emails_by_report = logs_filtered.groupby("ReportType")["EmailsSent"].sum()
-        st.bar_chart(emails_by_report)
+        st.bar_chart(emails_by_report, width="stretch")
 
     st.markdown("### Top Performing Centers")
     if center_logs_filtered.empty:
@@ -905,14 +667,14 @@ def render_dashboard():
         st.dataframe(top_centers, width="stretch")
 
     st.markdown("### Error Tracking")
-    err1, err2, err3 = st.columns(3)
-    with err1:
+    e1, e2, e3 = st.columns(3)
+    with e1:
         metric_card("Missing Emails", total_missing_emails)
-    with err2:
-        recent_error_count = int(error_logs_filtered["Count"].sum()) if not error_logs_filtered.empty and "Count" in error_logs_filtered.columns else 0
+    with e2:
+        recent_error_count = int(error_logs_filtered["Count"].sum()) if not error_logs_filtered.empty else 0
         metric_card("Logged Errors", recent_error_count)
-    with err3:
-        live_runs = int((logs_filtered["Mode"] == "LIVE").sum()) if "Mode" in logs_filtered.columns and not logs_filtered.empty else 0
+    with e3:
+        live_runs = int((logs_filtered["Mode"] == "LIVE").sum()) if "Mode" in logs_filtered.columns else 0
         metric_card("Live Runs", live_runs)
 
     if not error_logs_filtered.empty:
@@ -921,18 +683,223 @@ def render_dashboard():
         st.dataframe(recent_errors, width="stretch")
 
     st.markdown("### Recent Activity")
-    recent_cols = [
-        col for col in ["Timestamp", "ReportType", "TotalRows", "PayableLeads", "Centers", "EmailsSent", "Mode", "MissingEmails"]
-        if col in logs_filtered.columns
-    ]
+    recent_cols = ["Timestamp", "ReportType", "TotalRows", "PayableLeads", "Centers", "EmailsSent", "Mode", "MissingEmails"]
     recent_df = logs_filtered.sort_values(by="Timestamp", ascending=False).head(10)[recent_cols]
     st.dataframe(recent_df, width="stretch")
 
 
+def render_center_profiles_page():
+    st.markdown(
+        """
+        <div style="font-size: 28px; font-weight: 800; color: #111827;">
+            Center Profiles
+        </div>
+        <div style="font-size: 15px; color: #6b7280; margin-top: 4px; margin-bottom: 16px;">
+            Master directory for all call centers, contacts, notes, and report identifiers.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    profiles_df = load_center_profiles()
+
+    st.markdown("### Add New Center")
+
+    a1, a2, a3 = st.columns(3)
+
+    with a1:
+        new_center_name = st.text_input("Center Name")
+        new_country = st.text_input("Country")
+        new_contact = st.text_input("Contact Person")
+        new_team_email = st.text_input("Team Email")
+        new_phone = st.text_input("Phone")
+
+    with a2:
+        new_cgm_id = st.text_input("CGM Identifier")
+        new_ecp_id = st.text_input("ECP Identifier")
+        new_ma_id = st.text_input("MA Identifier")
+        new_campaign = st.text_input("Campaign")
+        new_comm_pref = st.text_input("Communication Preference")
+
+    with a3:
+        new_payment_source = st.text_input("Payment Source")
+        new_payment_email = st.text_input("Payment Email")
+        new_payment_details = st.text_input("Payment Details")
+        new_notes = st.text_area("Notes")
+        new_active = st.selectbox("Active", ["Yes", "No"], index=0)
+
+    if st.button("Save New Center", type="primary", width="stretch"):
+        if not new_center_name.strip():
+            st.error("Center Name is required.")
+        else:
+            new_row = {col: "" for col in CENTER_PROFILE_HEADERS}
+            new_row["CenterName"] = new_center_name
+            new_row["Country"] = new_country
+            new_row["ContactPerson"] = new_contact
+            new_row["TeamEmail"] = new_team_email
+            new_row["Phone"] = new_phone
+            new_row["CGMIdentifier"] = new_cgm_id
+            new_row["ECPIdentifier"] = new_ecp_id
+            new_row["MAIdentifier"] = new_ma_id
+            new_row["Campaign"] = new_campaign
+            new_row["CommunicationPreference"] = new_comm_pref
+            new_row["PaymentSource"] = new_payment_source
+            new_row["PaymentEmail"] = new_payment_email
+            new_row["PaymentDetails"] = new_payment_details
+            new_row["Notes"] = new_notes
+            new_row["Active"] = new_active
+
+            updated_df = pd.concat([profiles_df, pd.DataFrame([new_row])], ignore_index=True)
+            updated_df = updated_df.fillna("")
+            updated_df["CenterName"] = updated_df["CenterName"].apply(normalize_text)
+            updated_df = updated_df[updated_df["CenterName"] != ""]
+            updated_df = updated_df.drop_duplicates(subset=["CenterName"], keep="last")
+            save_center_profiles(updated_df)
+            st.success("New center saved.")
+            st.rerun()
+
+    st.markdown("### Center Directory")
+
+    search_text = st.text_input("Search centers")
+    filtered_df = profiles_df.copy()
+
+    if search_text.strip():
+        mask = filtered_df.apply(
+            lambda col: col.astype(str).str.contains(search_text, case=False, na=False)
+        ).any(axis=1)
+        filtered_df = filtered_df[mask]
+
+    if filtered_df.empty:
+        st.info("No centers found.")
+    else:
+        for idx, row in filtered_df.iterrows():
+            with st.container():
+                st.markdown(
+                    f"""
+                    <div style="
+                        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+                        border: 1px solid #e5e7eb;
+                        border-radius: 16px;
+                        padding: 18px;
+                        margin-bottom: 14px;
+                        box-shadow: 0 4px 12px rgba(0,0,0,0.04);">
+                        <div style="font-size: 20px; font-weight: 800; color: #111827;">
+                            {normalize_text(row.get('CenterName', ''))}
+                        </div>
+                        <div style="font-size: 13px; color: #6b7280; margin-top: 4px;">
+                            {normalize_text(row.get('Country', ''))} • {normalize_text(row.get('ContactPerson', ''))}
+                        </div>
+                        <div style="margin-top: 8px; font-size: 13px;">
+                            📧 {normalize_text(row.get('TeamEmail', ''))}
+                        </div>
+                        <div style="margin-top: 8px; font-size: 12px; color: #374151;">
+                            CGM: {normalize_text(row.get('CGMIdentifier', ''))} |
+                            ECP: {normalize_text(row.get('ECPIdentifier', ''))} |
+                            MA: {normalize_text(row.get('MAIdentifier', ''))}
+                        </div>
+                        <div style="margin-top: 8px; font-size: 12px; color: #6b7280;">
+                            {normalize_text(row.get('Notes', ''))}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Edit", key=f"edit_center_{idx}", width="stretch"):
+                        st.session_state["edit_center_idx"] = idx
+                        st.rerun()
+
+                with c2:
+                    if st.button("Delete", key=f"delete_center_{idx}", width="stretch"):
+                        updated_df = profiles_df.drop(index=idx).reset_index(drop=True)
+                        save_center_profiles(updated_df)
+                        st.warning("Center deleted.")
+                        st.rerun()
+
+    if "edit_center_idx" in st.session_state:
+        edit_idx = st.session_state["edit_center_idx"]
+        edit_row = profiles_df.loc[edit_idx]
+
+        st.markdown("### Edit Center")
+
+        e1, e2, e3 = st.columns(3)
+
+        with e1:
+            edit_center_name = st.text_input("Edit Center Name", value=edit_row.get("CenterName", ""), key="edit_center_name")
+            edit_country = st.text_input("Edit Country", value=edit_row.get("Country", ""), key="edit_country")
+            edit_contact = st.text_input("Edit Contact Person", value=edit_row.get("ContactPerson", ""), key="edit_contact")
+            edit_team_email = st.text_input("Edit Team Email", value=edit_row.get("TeamEmail", ""), key="edit_team_email")
+            edit_phone = st.text_input("Edit Phone", value=edit_row.get("Phone", ""), key="edit_phone")
+
+        with e2:
+            edit_cgm_id = st.text_input("Edit CGM Identifier", value=edit_row.get("CGMIdentifier", ""), key="edit_cgm")
+            edit_ecp_id = st.text_input("Edit ECP Identifier", value=edit_row.get("ECPIdentifier", ""), key="edit_ecp")
+            edit_ma_id = st.text_input("Edit MA Identifier", value=edit_row.get("MAIdentifier", ""), key="edit_ma")
+            edit_campaign = st.text_input("Edit Campaign", value=edit_row.get("Campaign", ""), key="edit_campaign")
+            edit_comm_pref = st.text_input("Edit Communication Preference", value=edit_row.get("CommunicationPreference", ""), key="edit_comm")
+
+        with e3:
+            edit_payment_source = st.text_input("Edit Payment Source", value=edit_row.get("PaymentSource", ""), key="edit_pay_source")
+            edit_payment_email = st.text_input("Edit Payment Email", value=edit_row.get("PaymentEmail", ""), key="edit_pay_email")
+            edit_payment_details = st.text_input("Edit Payment Details", value=edit_row.get("PaymentDetails", ""), key="edit_pay_details")
+            edit_notes = st.text_area("Edit Notes", value=edit_row.get("Notes", ""), key="edit_notes")
+            edit_active = st.selectbox("Edit Active", ["Yes", "No"], index=0 if edit_row.get("Active", "Yes") == "Yes" else 1, key="edit_active")
+
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("Save Center Changes", width="stretch"):
+                for col in CENTER_PROFILE_HEADERS:
+                    if col not in profiles_df.columns:
+                        profiles_df[col] = ""
+
+                profiles_df.at[edit_idx, "CenterName"] = edit_center_name
+                profiles_df.at[edit_idx, "Country"] = edit_country
+                profiles_df.at[edit_idx, "ContactPerson"] = edit_contact
+                profiles_df.at[edit_idx, "TeamEmail"] = edit_team_email
+                profiles_df.at[edit_idx, "Phone"] = edit_phone
+                profiles_df.at[edit_idx, "CGMIdentifier"] = edit_cgm_id
+                profiles_df.at[edit_idx, "ECPIdentifier"] = edit_ecp_id
+                profiles_df.at[edit_idx, "MAIdentifier"] = edit_ma_id
+                profiles_df.at[edit_idx, "Campaign"] = edit_campaign
+                profiles_df.at[edit_idx, "CommunicationPreference"] = edit_comm_pref
+                profiles_df.at[edit_idx, "PaymentSource"] = edit_payment_source
+                profiles_df.at[edit_idx, "PaymentEmail"] = edit_payment_email
+                profiles_df.at[edit_idx, "PaymentDetails"] = edit_payment_details
+                profiles_df.at[edit_idx, "Notes"] = edit_notes
+                profiles_df.at[edit_idx, "Active"] = edit_active
+
+                save_center_profiles(profiles_df)
+                st.success("Center updated.")
+                del st.session_state["edit_center_idx"]
+                st.rerun()
+
+        with s2:
+            if st.button("Cancel Edit", width="stretch"):
+                del st.session_state["edit_center_idx"]
+                st.rerun()
+
+    with st.expander("Advanced Table Editor"):
+        edited_df = st.data_editor(profiles_df, width="stretch", num_rows="dynamic", key="profiles_table_editor")
+        if st.button("Save Table Changes", width="stretch"):
+            save_center_profiles(edited_df)
+            st.success("Table changes saved.")
+            st.rerun()
+
+
 # =========================
-# REPORT PAGES
+# REPORT PAGE ENGINE
 # =========================
-def render_report_page(report_key, report_name, identifier_label, file_type, needs_conversion_stats, remove_columns, custom_payable_rule=None):
+def render_report_page(
+    report_key,
+    report_name,
+    identifier_label,
+    profile_identifier_col,
+    file_type,
+    remove_columns,
+    custom_payable_rule=None
+):
     back_col, title_col = st.columns([1, 6])
 
     with back_col:
@@ -946,16 +913,23 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                 {report_name}
             </div>
             <div style="font-size: 15px; color: #6b7280; margin-top: 4px; margin-bottom: 16px;">
-                Run report, review results, manage mappings, and send files.
+                Run report, review results, use center profiles for mapping, and send files.
             </div>
             """,
             unsafe_allow_html=True
         )
 
-    page_tab1, page_tab2 = st.tabs(["Run Report", "Manage Mappings"])
+    page_tab1, page_tab2 = st.tabs(["Run Report", "Center Profiles"])
 
     with page_tab2:
-        render_mapping_manager(report_key, report_name, identifier_label)
+        profiles_df = load_center_profiles()
+        cols_to_show = ["CenterName", "TeamEmail", profile_identifier_col, "ContactPerson", "Notes", "Active"]
+        cols_to_show = [c for c in cols_to_show if c in profiles_df.columns]
+        st.subheader(f"{report_name} Profile Mapping View")
+        st.dataframe(profiles_df[cols_to_show], width="stretch")
+        st.caption(f"This report uses `{profile_identifier_col}` from Center Profiles as its mapping source.")
+        if st.button("Open Full Center Profiles", key=f"profiles_jump_{report_key}", width="stretch"):
+            go_to("profiles")
 
     with page_tab1:
         controls_left, controls_mid, controls_right = st.columns([1, 1, 2])
@@ -968,7 +942,6 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
             st.info(f"Every email from this workflow is automatically CC'd to: {CC_EMAIL}")
 
         show_mode_banner(test_mode)
-
         render_upload_instructions(report_name, file_type)
         render_excel_tab_requirements(report_name)
 
@@ -986,37 +959,22 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
             return
 
         try:
-            workbook_lookup = pd.DataFrame(columns=["Identifier", "CenterName", "Email"])
             detail_df = pd.DataFrame()
-            conversion_df = pd.DataFrame()
-            disposition_col = None
-            paidamount_col = None
+            raw_preview_df = pd.DataFrame()
 
             if file_type == "excel":
                 try:
                     xls = pd.ExcelFile(uploaded_file)
-                except ImportError:
-                    st.error(
-                        "This app needs the Excel package `openpyxl` installed to read Excel files. "
-                        "Please update `requirements.txt` to include `openpyxl` and reboot the app."
-                    )
-                    return
                 except Exception as e:
                     st.error(f"Could not open this Excel file: {e}")
                     st.info("Please make sure you uploaded a valid Excel workbook.")
                     return
 
-                sheet_names = xls.sheet_names
-
                 detail_sheet = None
-                conversion_sheet = None
-
-                for sheet in sheet_names:
-                    s = sheet.strip().lower()
-                    if "detail" in s:
+                for sheet in xls.sheet_names:
+                    if "detail" in sheet.strip().lower():
                         detail_sheet = sheet
-                    if "conversion" in s and "stats" in s:
-                        conversion_sheet = sheet
+                        break
 
                 if detail_sheet is None:
                     st.error("Could not find the Detail sheet in this workbook.")
@@ -1024,68 +982,42 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                     return
 
                 detail_df = pd.read_excel(uploaded_file, sheet_name=detail_sheet)
-                uploaded_file.seek(0)
-
-                if needs_conversion_stats:
-                    if conversion_sheet is None:
-                        st.warning(
-                            "Could not find the Conversion Stats sheet. "
-                            "The app will use the report mapping table instead."
-                        )
-                        conversion_df = pd.DataFrame()
-                    else:
-                        conversion_df = pd.read_excel(uploaded_file, sheet_name=conversion_sheet)
-                        uploaded_file.seek(0)
-                        workbook_lookup = build_workbook_lookup(conversion_df)
-
-                id_col = find_column(detail_df, [identifier_label, identifier_label.replace(" ", "")])
-                paidamount_col = find_column(detail_df, ["PaidAmount", "Paid Amount"])
-                disposition_col = find_column(detail_df, ["Disposition"])
-
-                if id_col is None:
-                    st.error(f"Could not find {identifier_label} in the Detail sheet.")
-                    st.info("Please verify you uploaded the correct workbook for this report.")
-                    return
-
-                merged_df = merge_with_mapping(detail_df, id_col, get_mapping_df(report_key), workbook_lookup)
+                raw_preview_df = detail_df.copy()
 
             else:
                 try:
                     detail_df = pd.read_csv(uploaded_file)
+                    raw_preview_df = detail_df.copy()
                 except Exception as e:
                     st.error(f"Could not open this CSV file: {e}")
                     st.info("Please make sure you uploaded a valid CSV export.")
                     return
 
-                id_col = find_column(detail_df, [identifier_label, identifier_label.replace(" ", "")])
-                duration_col = find_column(detail_df, ["Duration"])
-                disposition_col = find_column(detail_df, ["Disposition"])
+            id_col = find_column(detail_df, [identifier_label, identifier_label.replace(" ", "")])
+            if id_col is None:
+                st.error(f"Could not find {identifier_label} in the uploaded file.")
+                return
 
-                if id_col is None:
-                    st.error(f"Could not find {identifier_label} in the CSV.")
-                    st.info("Please verify you uploaded the correct ECP CSV report.")
+            disposition_col = find_column(detail_df, ["Disposition"])
+            paidamount_col = find_column(detail_df, ["PaidAmount", "Paid Amount"])
+
+            if custom_payable_rule == "ecp":
+                duration_col = find_column(detail_df, ["Duration"])
+                if duration_col is None or disposition_col is None:
+                    st.error("ECP requires both Duration and Disposition columns to calculate Payable.")
                     return
 
-                if custom_payable_rule == "ecp":
-                    if duration_col is None or disposition_col is None:
-                        st.error("Could not find Duration and/or Disposition in the ECP CSV.")
-                        st.info("ECP requires both Duration and Disposition columns to calculate Payable.")
-                        return
-
-                    detail_df["Payable"] = detail_df.apply(
-                        lambda row: "Y"
-                        if normalize_text(row[disposition_col]).lower() == "transfer sale"
-                        and pd.to_numeric(row[duration_col], errors="coerce") >= 120
-                        else "N",
-                        axis=1
-                    )
-
-                merged_df = merge_with_mapping(
-                    detail_df,
-                    id_col,
-                    get_mapping_df(report_key),
-                    pd.DataFrame(columns=["Identifier", "CenterName", "Email"])
+                detail_df["Payable"] = detail_df.apply(
+                    lambda row: "Y"
+                    if normalize_text(row[disposition_col]).lower() == "transfer sale"
+                    and pd.to_numeric(row[duration_col], errors="coerce") >= 120
+                    else "N",
+                    axis=1
                 )
+
+            profiles_df = load_center_profiles()
+            profile_lookup = build_profile_lookup(profiles_df, profile_identifier_col)
+            merged_df = merge_with_profile_lookup(detail_df, id_col, profile_lookup)
 
             summary_rows = []
 
@@ -1149,15 +1081,13 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
 
                     cols_to_remove = [
                         "Identifier_normalized",
-                        "Identifier_workbook",
-                        "Identifier_mapping",
+                        "Identifier",
+                        "CenterName",
+                        "Email",
                         "FinalCenterName",
                         "FinalEmail",
-                        "CenterName_workbook",
-                        "Email_workbook",
-                        "CenterName_mapping",
-                        "Email_mapping",
-                        "Identifier"
+                        "ProfileNotes",
+                        "ContactPerson"
                     ] + remove_columns
 
                     export_group = group.drop(columns=cols_to_remove, errors="ignore")
@@ -1214,7 +1144,7 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
                 st.dataframe(summary_df, width="stretch")
 
                 if not missing_email_df.empty:
-                    st.warning("Some centers are missing email addresses. Update the mapping page before live sending.")
+                    st.warning("Some centers are missing emails in Center Profiles.")
                     st.dataframe(missing_email_df, width="stretch")
 
                 if not disposition_summary.empty:
@@ -1240,8 +1170,8 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
 
             with tab3:
                 st.subheader("Email Queue")
-                email_preview_rows = []
 
+                email_preview_rows = []
                 for item in vendor_files:
                     email_preview_rows.append({
                         "CenterName": item["CenterName"],
@@ -1333,16 +1263,101 @@ def render_report_page(report_key, report_name, identifier_label, file_type, nee
 
             with tab4:
                 st.subheader("Raw Preview")
-                st.dataframe(detail_df.head(20), width="stretch")
-                if not conversion_df.empty:
-                    st.subheader("Conversion Stats Preview")
-                    st.dataframe(conversion_df.head(20), width="stretch")
+                st.dataframe(raw_preview_df.head(20), width="stretch")
 
-            st.info(f"Every email in this workflow will CC: {CC_EMAIL}")
+            st.info(f"This report maps `{identifier_label}` to `{profile_identifier_col}` in Center Profiles.")
 
         except Exception as e:
             st.error(f"Something went wrong while processing this file: {e}")
             st.info("Please verify that you uploaded the correct report file and that the expected columns are present.")
+
+
+# =========================
+# SESSION + SECRETS
+# =========================
+sender_email = st.secrets["EMAIL"]
+gmail_app_password = st.secrets["PASSWORD"]
+site_password = st.secrets["APP_PASSWORD"]
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "dashboard"
+
+
+# =========================
+# LOGIN SCREEN
+# =========================
+if not st.session_state.authenticated:
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            background: linear-gradient(180deg, #020617 0%, #0f172a 100%);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col2:
+        st.markdown(
+            """
+            <div style="text-align: center; padding-top: 60px; padding-bottom: 20px;">
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.image(LOGO_FILE, width=260)
+
+        st.markdown(
+            """
+            <div style="font-size: 30px; font-weight: 800; color: white; margin-top: 12px;">
+                LIVMED Report Portal
+            </div>
+            <div style="font-size: 15px; color: #cbd5e1; margin-top: 8px; margin-bottom: 20px;">
+                Secure access required
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        entered_password = st.text_input("Access Password", type="password")
+        login_clicked = st.button("Login", width="stretch")
+
+        if login_clicked:
+            if entered_password == site_password:
+                st.session_state.authenticated = True
+                st.session_state.current_page = "dashboard"
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.stop()
+
+
+# =========================
+# MAIN HEADER
+# =========================
+show_top_header()
+
+top_left, top_mid, top_right = st.columns([5, 1, 1])
+
+with top_mid:
+    if st.button("Dashboard", width="stretch"):
+        st.session_state.current_page = "dashboard"
+        st.rerun()
+
+with top_right:
+    if st.button("Log out", width="stretch"):
+        st.session_state.authenticated = False
+        st.session_state.current_page = "dashboard"
+        st.rerun()
 
 
 # =========================
@@ -1353,13 +1368,16 @@ current_page = st.session_state.current_page
 if current_page == "dashboard":
     render_dashboard()
 
+elif current_page == "profiles":
+    render_center_profiles_page()
+
 elif current_page == "cgm":
     render_report_page(
         report_key="cgm",
         report_name="CGM Report",
         identifier_label="LeadSource",
+        profile_identifier_col="CGMIdentifier",
         file_type="excel",
-        needs_conversion_stats=True,
         remove_columns=[
             "PaidAmount",
             "Paid Amount",
@@ -1376,8 +1394,8 @@ elif current_page == "ecp":
         report_key="ecp",
         report_name="ECP Report",
         identifier_label="Sub Id",
+        profile_identifier_col="ECPIdentifier",
         file_type="csv",
-        needs_conversion_stats=False,
         remove_columns=[],
         custom_payable_rule="ecp"
     )
@@ -1387,8 +1405,8 @@ elif current_page == "medadv":
         report_key="medadv",
         report_name="Med Advantage Report",
         identifier_label="LeadSource",
+        profile_identifier_col="MAIdentifier",
         file_type="excel",
-        needs_conversion_stats=True,
         remove_columns=[
             "PaidAmount",
             "Paid Amount",
