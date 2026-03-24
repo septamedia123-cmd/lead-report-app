@@ -219,6 +219,12 @@ def go_to(page_name):
     st.rerun()
 
 
+def open_center_profile(center_name):
+    st.session_state.selected_center_name = center_name
+    st.session_state.current_page = "profile_detail"
+    st.rerun()
+
+
 def apply_date_filter(df, option):
     if df.empty or "Timestamp" not in df.columns:
         return df
@@ -805,13 +811,15 @@ def render_center_profiles_page():
                     unsafe_allow_html=True
                 )
 
-                c1, c2 = st.columns(2)
+                c1, c2, c3 = st.columns(3)
                 with c1:
+                    if st.button("Open Profile", key=f"open_center_{idx}", width="stretch"):
+                        open_center_profile(normalize_text(row.get("CenterName", "")))
+                with c2:
                     if st.button("Edit", key=f"edit_center_{idx}", width="stretch"):
                         st.session_state["edit_center_idx"] = idx
                         st.rerun()
-
-                with c2:
+                with c3:
                     if st.button("Delete", key=f"delete_center_{idx}", width="stretch"):
                         updated_df = profiles_df.drop(index=idx).reset_index(drop=True)
                         save_center_profiles(updated_df)
@@ -886,6 +894,171 @@ def render_center_profiles_page():
             save_center_profiles(edited_df)
             st.success("Table changes saved.")
             st.rerun()
+
+
+def render_center_profile_detail_page():
+    profiles_df = load_center_profiles()
+    center_logs_df = load_center_logs()
+    error_logs_df = load_error_logs()
+
+    selected_center = normalize_text(st.session_state.get("selected_center_name", ""))
+
+    if not selected_center:
+        st.warning("No center selected.")
+        if st.button("Back to Center Profiles", width="stretch"):
+            go_to("profiles")
+        return
+
+    match_df = profiles_df[profiles_df["CenterName"].apply(normalize_text) == selected_center]
+    if match_df.empty:
+        st.warning("That center could not be found.")
+        if st.button("Back to Center Profiles", width="stretch"):
+            go_to("profiles")
+        return
+
+    row = match_df.iloc[0]
+
+    back_col, title_col = st.columns([1, 6])
+    with back_col:
+        if st.button("← Back", width="stretch"):
+            go_to("profiles")
+    with title_col:
+        st.markdown(
+            f"""
+            <div style="font-size: 30px; font-weight: 800; color: #111827;">
+                {selected_center}
+            </div>
+            <div style="font-size: 15px; color: #6b7280; margin-top: 4px;">
+                {normalize_text(row.get('Country', ''))} • {normalize_text(row.get('Active', ''))}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    i1, i2 = st.columns(2)
+
+    with i1:
+        st.markdown("### Basic Info")
+        basic_info = pd.DataFrame({
+            "Field": ["Center Name", "Country", "Address", "Phone", "Contact Person", "Communication Preference", "Team Email", "Campaign", "Active"],
+            "Value": [
+                row.get("CenterName", ""),
+                row.get("Country", ""),
+                row.get("Address", ""),
+                row.get("Phone", ""),
+                row.get("ContactPerson", ""),
+                row.get("CommunicationPreference", ""),
+                row.get("TeamEmail", ""),
+                row.get("Campaign", ""),
+                row.get("Active", "")
+            ]
+        })
+        st.dataframe(basic_info, width="stretch", hide_index=True)
+
+    with i2:
+        st.markdown("### Report Identifiers")
+        ids_df = pd.DataFrame({
+            "Report": ["CGM", "ECP", "BGM", "Med Advantage"],
+            "Identifier": [
+                row.get("CGMIdentifier", ""),
+                row.get("ECPIdentifier", ""),
+                row.get("BGMIdentifier", ""),
+                row.get("MAIdentifier", "")
+            ],
+            "DID": [
+                row.get("CGMDID", ""),
+                row.get("ECPDID", ""),
+                row.get("BGMDID", ""),
+                row.get("MADID", "")
+            ]
+        })
+        st.dataframe(ids_df, width="stretch", hide_index=True)
+
+    p1, p2 = st.columns(2)
+
+    with p1:
+        st.markdown("### Payment / Operations")
+        payment_df = pd.DataFrame({
+            "Field": ["Payment Source", "Payment Email", "Payment Details"],
+            "Value": [
+                row.get("PaymentSource", ""),
+                row.get("PaymentEmail", ""),
+                row.get("PaymentDetails", "")
+            ]
+        })
+        st.dataframe(payment_df, width="stretch", hide_index=True)
+
+    with p2:
+        st.markdown("### Notes")
+        st.text_area("Notes", value=row.get("Notes", ""), height=180, disabled=True, key="profile_notes_view")
+
+    center_history = center_logs_df[center_logs_df["CenterName"].apply(normalize_text) == selected_center].copy()
+    center_errors = error_logs_df[
+        error_logs_df["Details"].astype(str).str.contains(selected_center, case=False, na=False)
+    ].copy()
+
+    total_leads = int(center_history["TotalRows"].sum()) if not center_history.empty else 0
+    total_payable = int(center_history["PayableLeads"].sum()) if not center_history.empty else 0
+    total_emails = int((center_history["MissingEmail"] == 0).sum()) if not center_history.empty else 0
+    missing_email_issues = int(center_history["MissingEmail"].sum()) if not center_history.empty else 0
+    conversion_rate = f"{(total_payable / total_leads * 100):.1f}%" if total_leads > 0 else "0.0%"
+    last_run = "N/A"
+    if not center_history.empty and center_history["Timestamp"].notna().any():
+        last_run = center_history["Timestamp"].max().strftime("%Y-%m-%d %H:%M")
+
+    st.markdown("### Performance Snapshot")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1:
+        metric_card("Total Leads", total_leads)
+    with m2:
+        metric_card("Payable Leads", total_payable)
+    with m3:
+        metric_card("Conversion Rate", conversion_rate)
+    with m4:
+        metric_card("Emails Sent", total_emails)
+    with m5:
+        metric_card("Last Run", last_run)
+    with m6:
+        metric_card("Missing Email Issues", missing_email_issues)
+
+    st.markdown("### Alerts")
+    alerts = []
+
+    if normalize_text(row.get("TeamEmail", "")) == "":
+        alerts.append("Missing Team Email.")
+    if normalize_text(row.get("CGMIdentifier", "")) == "" and normalize_text(row.get("ECPIdentifier", "")) == "" and normalize_text(row.get("MAIdentifier", "")) == "":
+        alerts.append("No active report identifiers assigned.")
+    if center_history.empty:
+        alerts.append("No report activity logged yet for this center.")
+    else:
+        most_recent = center_history["Timestamp"].max()
+        if pd.notna(most_recent):
+            days_since = (pd.Timestamp.now() - most_recent).days
+            if days_since > 30:
+                alerts.append("No report activity in the last 30 days.")
+    if missing_email_issues > 0:
+        alerts.append(f"{missing_email_issues} run(s) logged with missing email status.")
+
+    if alerts:
+        for alert in alerts:
+            st.warning(alert)
+    else:
+        st.success("No active alerts for this center.")
+
+    st.markdown("### Activity History")
+    if center_history.empty:
+        st.info("No activity history found for this center.")
+    else:
+        history_cols = ["Timestamp", "ReportType", "Identifier", "TotalRows", "PayableLeads", "Mode", "MissingEmail"]
+        st.dataframe(
+            center_history.sort_values(by="Timestamp", ascending=False)[history_cols].head(15),
+            width="stretch"
+        )
+
+    if not center_errors.empty:
+        st.markdown("### Error History")
+        err_cols = ["Timestamp", "ReportType", "ErrorType", "Details", "Count", "Mode"]
+        st.dataframe(center_errors.sort_values(by="Timestamp", ascending=False)[err_cols].head(10), width="stretch")
 
 
 # =========================
@@ -1285,6 +1458,9 @@ if "authenticated" not in st.session_state:
 if "current_page" not in st.session_state:
     st.session_state.current_page = "dashboard"
 
+if "selected_center_name" not in st.session_state:
+    st.session_state.selected_center_name = ""
+
 
 # =========================
 # LOGIN SCREEN
@@ -1370,6 +1546,9 @@ if current_page == "dashboard":
 
 elif current_page == "profiles":
     render_center_profiles_page()
+
+elif current_page == "profile_detail":
+    render_center_profile_detail_page()
 
 elif current_page == "cgm":
     render_report_page(
