@@ -557,165 +557,6 @@ def render_excel_tab_requirements(report_name):
 
 
 # =========================
-# SECURITY / EXPORT SAFETY
-# =========================
-# These fields must NEVER appear in rep/vendor/customer-facing exports.
-# This protects internal costs, margins, base prices, profit data, and internal pricing.
-SENSITIVE_EXPORT_EXACT_COLUMNS = {
-    "base price", "base_price", "baseprice", "cost", "costs",
-    "vendor cost", "vendor_cost", "vendorcost",
-    "wholesale cost", "wholesale_cost", "wholesalecost",
-    "internal cost", "internal_cost", "internalcost",
-    "internal price", "internal_price", "internalprice",
-    "buy price", "buy_price", "buyprice",
-    "purchase cost", "purchase_cost", "purchasecost",
-    "acquisition cost", "acquisition_cost", "acquisitioncost",
-    "cogs", "profit", "profits", "gross profit", "gross_profit", "grossprofit",
-    "net profit", "net_profit", "netprofit", "margin", "margins",
-    "gross margin", "gross_margin", "grossmargin", "markup", "mark up", "mark_up",
-    "base", "internal notes", "internal_notes", "internalnotes",
-}
-
-SENSITIVE_EXPORT_KEYWORDS = [
-    "base price", "base_price", "baseprice", "cost", "vendor cost", "vendor_cost",
-    "wholesale", "internal", "buy price", "purchase cost", "acquisition",
-    "cogs", "profit", "margin", "markup", "mark up",
-]
-
-
-def normalize_column_key(col):
-    return str(col).strip().lower().replace("-", " ").replace("_", " ")
-
-
-def is_sensitive_export_column(col):
-    raw = str(col).strip().lower()
-    normalized = normalize_column_key(col)
-    compact = normalized.replace(" ", "")
-
-    if raw in SENSITIVE_EXPORT_EXACT_COLUMNS:
-        return True
-    if normalized in SENSITIVE_EXPORT_EXACT_COLUMNS:
-        return True
-    if compact in SENSITIVE_EXPORT_EXACT_COLUMNS:
-        return True
-
-    for keyword in SENSITIVE_EXPORT_KEYWORDS:
-        k_norm = keyword.strip().lower().replace("_", " ")
-        k_compact = k_norm.replace(" ", "")
-        if k_norm and k_norm in normalized:
-            return True
-        if k_compact and k_compact in compact:
-            return True
-
-    return False
-
-
-def get_sensitive_columns(df):
-    if df is None or df.empty:
-        return []
-    return [col for col in df.columns if is_sensitive_export_column(col)]
-
-
-def safe_export_dataframe(df, extra_remove_columns=None):
-    """
-    Creates a rep/vendor-safe export by removing:
-    1. Internal merge/helper columns
-    2. Workflow-specific remove_columns
-    3. Any column that looks like base price, cost, vendor cost, margin, profit, wholesale, internal price, etc.
-
-    IMPORTANT:
-    Never export raw report objects directly to vendor/rep-facing files.
-    """
-    if df is None:
-        return pd.DataFrame()
-
-    export_df = df.copy()
-
-    always_remove = [
-        "Identifier_normalized", "Identifier", "CenterName", "Email", "FinalCenterName",
-        "FinalEmail", "ProfileNotes", "ContactPerson",
-    ]
-
-    remove_set = set(always_remove)
-    if extra_remove_columns:
-        remove_set.update(extra_remove_columns)
-
-    remove_set.update(get_sensitive_columns(export_df))
-    export_df = export_df.drop(columns=list(remove_set), errors="ignore")
-
-    # Final safety pass.
-    remaining_sensitive = get_sensitive_columns(export_df)
-    if remaining_sensitive:
-        export_df = export_df.drop(columns=remaining_sensitive, errors="ignore")
-
-    return export_df
-
-
-def assert_no_sensitive_columns(df, context="export"):
-    sensitive_cols = get_sensitive_columns(df)
-    if sensitive_cols:
-        raise ValueError(
-            f"Sensitive internal pricing/cost columns blocked from {context}: "
-            + ", ".join(map(str, sensitive_cols))
-        )
-
-
-def short_zip_report_name(report_key):
-    return f"{sanitize_filename(report_key)}_split_reports.zip"
-
-
-def build_sample_preview_df(vendor_files, max_rows=25):
-    """
-    Reads the first generated vendor/rep CSV in memory and returns a preview dataframe.
-    This is used for human review before enabling Send Emails.
-    """
-    if not vendor_files:
-        return pd.DataFrame()
-
-    first_file = vendor_files[0]
-    csv_bytes = first_file.get("CSVBytes", b"")
-    if not csv_bytes:
-        return pd.DataFrame()
-
-    try:
-        return pd.read_csv(io.BytesIO(csv_bytes)).head(max_rows)
-    except Exception:
-        return pd.DataFrame()
-
-
-def all_vendor_files_safe(vendor_files):
-    """
-    Final guardrail before sending.
-    Re-opens every generated CSV and blocks sending if any sensitive columns remain.
-    """
-    for item in vendor_files:
-        file_name = item.get("FileName", "Unknown file")
-        csv_bytes = item.get("CSVBytes", b"")
-
-        if not csv_bytes:
-            continue
-
-        df = pd.read_csv(io.BytesIO(csv_bytes))
-        sensitive = get_sensitive_columns(df)
-        if sensitive:
-            return False, file_name, sensitive
-
-    return True, "", []
-
-
-def set_review_state(report_key, value):
-    st.session_state[f"{report_key}_admin_review_approved"] = value
-
-
-def get_review_state(report_key):
-    return bool(st.session_state.get(f"{report_key}_admin_review_approved", False))
-
-
-def reset_review_state(report_key):
-    st.session_state[f"{report_key}_admin_review_approved"] = False
-
-
-# =========================
 # DASHBOARD / UI
 # =========================
 def dashboard_card(title, subtitle, button_text, page_key):
@@ -1290,12 +1131,6 @@ def render_report_page(
         if not validate_uploaded_file(uploaded_file, file_type, report_name):
             return
 
-        uploaded_signature = f"{uploaded_file.name}_{uploaded_file.size}"
-        signature_key = f"{report_key}_uploaded_signature"
-        if st.session_state.get(signature_key) != uploaded_signature:
-            st.session_state[signature_key] = uploaded_signature
-            reset_review_state(report_key)
-
         try:
             detail_df = pd.DataFrame()
             raw_preview_df = pd.DataFrame()
@@ -1335,13 +1170,6 @@ def render_report_page(
             if id_col is None:
                 st.error(f"Could not find {identifier_label} in the uploaded file.")
                 return
-
-            sensitive_found = get_sensitive_columns(detail_df)
-            if sensitive_found:
-                st.warning(
-                    "Internal pricing/cost columns were detected in the uploaded file and will be removed from all vendor/rep exports: "
-                    + ", ".join(map(str, sensitive_found))
-                )
 
             disposition_col = find_column(detail_df, ["Disposition"])
             paidamount_col = find_column(detail_df, ["PaidAmount", "Paid Amount"])
@@ -1424,13 +1252,18 @@ def render_report_page(
                     safe_identifier = sanitize_filename(identifier_value)
                     safe_center = sanitize_filename(center_name) if center_name else "UnknownCenter"
 
-                    export_group = safe_export_dataframe(
-                        group,
-                        extra_remove_columns=remove_columns
-                    )
+                    cols_to_remove = [
+                        "Identifier_normalized",
+                        "Identifier",
+                        "CenterName",
+                        "Email",
+                        "FinalCenterName",
+                        "FinalEmail",
+                        "ProfileNotes",
+                        "ContactPerson"
+                    ] + remove_columns
 
-                    # Hard stop if any sensitive pricing/cost fields remain.
-                    assert_no_sensitive_columns(export_group, context=f"{report_name} / {safe_center}")
+                    export_group = group.drop(columns=cols_to_remove, errors="ignore")
 
                     csv_bytes = export_group.to_csv(index=False).encode("utf-8")
                     csv_filename = f"{safe_center}__{safe_identifier}.csv"
@@ -1477,7 +1310,7 @@ def render_report_page(
             with m5:
                 metric_card("Ready to Send", ready_count)
 
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["Review", "Downloads", "Admin Review", "Email Queue", "Raw Preview"])
+            tab1, tab2, tab3, tab4 = st.tabs(["Review", "Downloads", "Email Queue", "Raw Preview"])
 
             with tab1:
                 st.subheader("Center Summary")
@@ -1496,7 +1329,7 @@ def render_report_page(
                 st.download_button(
                     label="Download ZIP of all center CSV files",
                     data=zip_buffer,
-                    file_name=short_zip_report_name(report_key),
+                    file_name=f"{report_key}_split_reports.zip",
                     mime="application/zip",
                     width="stretch"
                 )
@@ -1509,89 +1342,6 @@ def render_report_page(
                 )
 
             with tab3:
-                st.subheader("Admin Review Required Before Sending")
-
-                st.warning(
-                    "Emails are locked until you review the generated report output and approve this batch. "
-                    "This prevents Base Cost, cost, margin, profit, or internal pricing from being sent."
-                )
-
-                safe_status, unsafe_file, unsafe_cols = all_vendor_files_safe(vendor_files)
-
-                if safe_status:
-                    st.success("Automated safety scan passed: no sensitive cost/profit/margin columns were detected in the generated export files.")
-                else:
-                    st.error(
-                        "SEND BLOCKED: Sensitive internal columns were found in "
-                        f"{unsafe_file}: {', '.join(map(str, unsafe_cols))}"
-                    )
-                    reset_review_state(report_key)
-
-                st.markdown("### Sample Report Preview")
-                if vendor_files:
-                    first_item = vendor_files[0]
-                    st.caption(
-                        f"Previewing first generated file: {first_item.get('FileName', '')} "
-                        f"for {first_item.get('CenterName', '')}"
-                    )
-                    sample_preview_df = build_sample_preview_df(vendor_files, max_rows=30)
-
-                    if sample_preview_df.empty:
-                        st.info("Could not render a sample preview. Download the ZIP and review manually before approving.")
-                    else:
-                        st.dataframe(sample_preview_df, width="stretch")
-                        preview_sensitive = get_sensitive_columns(sample_preview_df)
-                        if preview_sensitive:
-                            st.error(
-                                "Sample preview contains sensitive columns: "
-                                + ", ".join(map(str, preview_sensitive))
-                            )
-                            reset_review_state(report_key)
-                        else:
-                            st.success("Sample preview does not show sensitive cost/profit/margin columns.")
-                else:
-                    st.info("No files generated to preview.")
-
-                st.markdown("### Manual Approval Checklist")
-                reviewed_sample = st.checkbox(
-                    "I reviewed the sample report preview.",
-                    key=f"{report_key}_reviewed_sample"
-                )
-                reviewed_zip = st.checkbox(
-                    "I downloaded and/or reviewed the ZIP output if needed.",
-                    key=f"{report_key}_reviewed_zip"
-                )
-                confirm_no_cost = st.checkbox(
-                    "I confirm Base Cost / Cost / Vendor Cost / Profit / Margin columns are NOT present in the generated reports.",
-                    key=f"{report_key}_confirm_no_cost"
-                )
-
-                can_approve = safe_status and reviewed_sample and confirm_no_cost
-
-                if st.button(
-                    "Approve Batch for Sending",
-                    key=f"{report_key}_approve_batch",
-                    type="primary",
-                    width="stretch",
-                    disabled=not can_approve
-                ):
-                    set_review_state(report_key, True)
-                    st.success("Batch approved. You may now go to Email Queue and send.")
-
-                if st.button(
-                    "Reset Approval",
-                    key=f"{report_key}_reset_approval",
-                    width="stretch"
-                ):
-                    reset_review_state(report_key)
-                    st.warning("Approval reset. Emails are locked again.")
-
-                if get_review_state(report_key):
-                    st.success("ADMIN APPROVAL COMPLETE — sending is unlocked for this uploaded file.")
-                else:
-                    st.error("ADMIN APPROVAL REQUIRED — emails cannot be sent yet.")
-
-            with tab4:
                 st.subheader("Email Queue")
 
                 email_preview_rows = []
@@ -1617,21 +1367,6 @@ def render_report_page(
                     )
 
                 send_disabled = False
-
-                safe_status, unsafe_file, unsafe_cols = all_vendor_files_safe(vendor_files)
-                admin_approved = get_review_state(report_key)
-
-                if not safe_status:
-                    send_disabled = True
-                    st.error(
-                        "Send blocked because sensitive internal columns were detected in "
-                        f"{unsafe_file}: {', '.join(map(str, unsafe_cols))}"
-                    )
-
-                if not admin_approved:
-                    send_disabled = True
-                    st.warning("Admin review approval is required before emails can be sent. Go to the Admin Review tab first.")
-
                 if test_mode and not test_email.strip():
                     send_disabled = True
                     st.info("Enter a test email to enable sending in Test Mode.")
@@ -1642,19 +1377,6 @@ def render_report_page(
 
                 if st.button("Send Emails", key=f"{report_key}_send_emails", type="primary", width="stretch", disabled=send_disabled):
                     try:
-                        final_safe, final_unsafe_file, final_unsafe_cols = all_vendor_files_safe(vendor_files)
-                        if not final_safe:
-                            st.error(
-                                "Final send blocked because sensitive internal columns were detected in "
-                                f"{final_unsafe_file}: {', '.join(map(str, final_unsafe_cols))}"
-                            )
-                            reset_review_state(report_key)
-                            return
-
-                        if not get_review_state(report_key):
-                            st.error("Final send blocked because admin approval is missing.")
-                            return
-
                         sent_count = send_vendor_emails(
                             vendor_files=vendor_files,
                             sender_email=sender_email,
@@ -1712,7 +1434,7 @@ def render_report_page(
                             pass
                         st.error(f"Email error: {e}")
 
-            with tab5:
+            with tab4:
                 st.subheader("Raw Preview")
                 st.dataframe(raw_preview_df.head(20), width="stretch")
 
@@ -1836,11 +1558,12 @@ elif current_page == "cgm":
         profile_identifier_col="CGMIdentifier",
         file_type="excel",
         remove_columns=[
-            "PaidAmount", "Paid Amount", "DiabeticOnMedicare", "Diabetic On Medicare",
-            "AssignedTo", "Assigned To", "Base Price", "BasePrice", "base_price",
-            "Cost", "Vendor Cost", "vendor_cost", "Wholesale Cost", "Internal Cost",
-            "Internal Price", "Profit", "Gross Profit", "Margin", "Gross Margin",
-            "Markup", "COGS", "Internal Notes"
+            "PaidAmount",
+            "Paid Amount",
+            "DiabeticOnMedicare",
+            "Diabetic On Medicare",
+            "AssignedTo",
+            "Assigned To"
         ],
         custom_payable_rule=None
     )
@@ -1852,11 +1575,7 @@ elif current_page == "ecp":
         identifier_label="Sub Id",
         profile_identifier_col="ECPIdentifier",
         file_type="csv",
-        remove_columns=[
-            "Base Price", "BasePrice", "base_price", "Cost", "Vendor Cost", "vendor_cost",
-            "Wholesale Cost", "Internal Cost", "Internal Price", "Profit", "Gross Profit",
-            "Margin", "Gross Margin", "Markup", "COGS", "Internal Notes"
-        ],
+        remove_columns=[],
         custom_payable_rule="ecp"
     )
 
@@ -1868,11 +1587,12 @@ elif current_page == "medadv":
         profile_identifier_col="MAIdentifier",
         file_type="excel",
         remove_columns=[
-            "PaidAmount", "Paid Amount", "DiabeticOnMedicare", "Diabetic On Medicare",
-            "AssignedTo", "Assigned To", "Base Price", "BasePrice", "base_price",
-            "Cost", "Vendor Cost", "vendor_cost", "Wholesale Cost", "Internal Cost",
-            "Internal Price", "Profit", "Gross Profit", "Margin", "Gross Margin",
-            "Markup", "COGS", "Internal Notes"
+            "PaidAmount",
+            "Paid Amount",
+            "DiabeticOnMedicare",
+            "Diabetic On Medicare",
+            "AssignedTo",
+            "Assigned To"
         ],
         custom_payable_rule=None
     )
