@@ -1,11 +1,16 @@
 import io
 import smtplib
 import zipfile
+from copy import copy
 import pandas as pd
 import streamlit as st
 import gspread
 from email.message import EmailMessage
 from google.oauth2.service_account import Credentials
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 
 st.set_page_config(
     page_title="LIVMED Report Portal",
@@ -1062,23 +1067,599 @@ def render_center_profile_detail_page():
 
 
 # =========================
-# REPORT PAGE ENGINE
+# REPORT PAGE ENGINE V2
 # =========================
-def render_report_page(
-    report_key,
-    report_name,
-    identifier_label,
-    profile_identifier_col,
-    file_type,
-    remove_columns,
-    custom_payable_rule=None
-):
-    back_col, title_col = st.columns([1, 6])
+REPORT_CONFIGS = {
+    "cgm": {
+        "report_key": "cgm",
+        "report_name": "CGM Report",
+        "dashboard_title": "CGM Report",
+        "dashboard_subtitle": "Upload Excel, split by LeadSource, review, approve, and send center workbooks.",
+        "button_text": "Open CGM",
+        "identifier_label": "LeadSource",
+        "profile_identifier_col": "CGMIdentifier",
+        "file_type": "excel",
+        "payable_rule": "existing_payable",
+        "remove_columns": ["PaidAmount", "Paid Amount", "DiabeticOnMedicare", "Diabetic On Medicare", "AssignedTo", "Assigned To"],
+        "remove_column_indexes": [],
+    },
+    "ecp": {
+        "report_key": "ecp",
+        "report_name": "ECP Report",
+        "dashboard_title": "ECP Report",
+        "dashboard_subtitle": "Upload CSV, calculate payable from duration, review, approve, and send center workbooks.",
+        "button_text": "Open ECP",
+        "identifier_label": "Sub Id",
+        "profile_identifier_col": "ECPIdentifier",
+        "file_type": "csv",
+        "payable_rule": "duration_column_k_over_630",
+        "remove_columns": [],
+        "remove_column_indexes": [4],  # Column E contains LivMed name and is hidden from final center reports.
+    },
+    "medadv": {
+        "report_key": "medadv",
+        "report_name": "Med Advantage Report",
+        "dashboard_title": "Med Advantage",
+        "dashboard_subtitle": "Upload Excel, split by LeadSource, review, approve, and send center workbooks.",
+        "button_text": "Open Med Adv",
+        "identifier_label": "LeadSource",
+        "profile_identifier_col": "MAIdentifier",
+        "file_type": "excel",
+        "payable_rule": "existing_payable",
+        "remove_columns": ["PaidAmount", "Paid Amount", "DiabeticOnMedicare", "Diabetic On Medicare", "AssignedTo", "Assigned To"],
+        "remove_column_indexes": [],
+    },
+}
 
+INTERNAL_MERGE_COLUMNS = [
+    "Identifier_normalized", "Identifier", "CenterName", "Email", "FinalCenterName",
+    "FinalEmail", "ProfileNotes", "ContactPerson"
+]
+
+
+def excel_sheet_name(value):
+    name = sanitize_filename(value).replace("_", " ").strip() or "Sheet"
+    for bad in [":", "\\", "/", "?", "*", "[", "]"]:
+        name = name.replace(bad, "")
+    return name[:31] or "Sheet"
+
+
+def apply_excel_widths(ws):
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        max_len = 10
+        for cell in ws[letter]:
+            max_len = max(max_len, len(str(cell.value or "")))
+        ws.column_dimensions[letter].width = min(max_len + 3, 45)
+
+
+def style_header_row(ws, row_num=1):
+    fill = PatternFill("solid", fgColor="1F4E78")
+    for cell in ws[row_num]:
+        cell.fill = fill
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+
+
+def write_df_to_sheet(wb, sheet_name, df, title=None, freeze=True):
+    ws = wb.create_sheet(excel_sheet_name(sheet_name))
+    start_row = 1
+    if title:
+        ws["A1"] = title
+        ws["A1"].font = Font(size=16, bold=True)
+        start_row = 3
+
+    safe_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    if safe_df.empty:
+        ws.cell(start_row, 1, "No data available")
+        apply_excel_widths(ws)
+        return ws
+
+    for c_idx, col in enumerate(safe_df.columns, 1):
+        ws.cell(start_row, c_idx, str(col))
+    style_header_row(ws, start_row)
+
+    for r_idx, row in enumerate(safe_df.itertuples(index=False), start_row + 1):
+        for c_idx, value in enumerate(row, 1):
+            if pd.isna(value):
+                value = ""
+            ws.cell(r_idx, c_idx, value)
+
+    if freeze:
+        ws.freeze_panes = f"A{start_row + 1}"
+    apply_excel_widths(ws)
+    return ws
+
+
+def df_to_excel_bytes(wb):
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def payable_counts(df):
+    col = find_column(df, ["Payable"])
+    if not col or col not in df.columns:
+        return 0, 0
+    s = df[col].astype(str).str.strip().str.upper()
+    return int((s == "Y").sum()), int((s == "N").sum())
+
+
+def prepare_uploaded_detail(uploaded_file, config):
+    file_type = config["file_type"]
+    if file_type == "excel":
+        xls = pd.ExcelFile(uploaded_file)
+        detail_sheet = None
+        for sheet in xls.sheet_names:
+            if "detail" in sheet.strip().lower():
+                detail_sheet = sheet
+                break
+        if detail_sheet is None:
+            raise ValueError("Could not find a Detail sheet in this workbook.")
+        detail_df = pd.read_excel(uploaded_file, sheet_name=detail_sheet)
+    else:
+        detail_df = pd.read_csv(uploaded_file)
+
+    detail_df.columns = [str(c).strip() for c in detail_df.columns]
+    return detail_df
+
+
+def apply_payable_rule(detail_df, config):
+    df = detail_df.copy()
+    rule = config.get("payable_rule", "existing_payable")
+
+    if rule == "duration_column_k_over_630":
+        if len(df.columns) <= 10:
+            raise ValueError("ECP requires Column K to exist because Column K is the Duration field.")
+        duration_col = df.columns[10]  # Column K, zero-based index 10.
+        duration_values = pd.to_numeric(df[duration_col], errors="coerce").fillna(0)
+        df["Payable"] = duration_values.apply(lambda x: "Y" if x > 630 else "N")
+        df["Payable Audit Reason"] = duration_values.apply(
+            lambda x: f"Payable: Column K duration {x:g} > 630 seconds" if x > 630
+            else f"Not payable: Column K duration {x:g} <= 630 seconds"
+        )
+        df["Payable Duration Seconds"] = duration_values
+        return df
+
+    payable_col = find_column(df, ["Payable"])
+    if payable_col and payable_col in df.columns:
+        df["Payable Audit Reason"] = df[payable_col].astype(str).apply(
+            lambda x: "Used Payable value from uploaded report: " + normalize_text(x)
+        )
+    else:
+        df["Payable"] = ""
+        df["Payable Audit Reason"] = "No Payable column found in uploaded report"
+    return df
+
+
+def remove_final_report_columns(group, config):
+    cols_to_remove = INTERNAL_MERGE_COLUMNS + config.get("remove_columns", [])
+    export_df = group.drop(columns=cols_to_remove, errors="ignore").copy()
+
+    remove_indexes = sorted(config.get("remove_column_indexes", []), reverse=True)
+    for idx in remove_indexes:
+        if 0 <= idx < len(export_df.columns):
+            export_df = export_df.drop(columns=[export_df.columns[idx]])
+    return export_df
+
+
+def build_disposition_summary(df):
+    disposition_col = find_column(df, ["Disposition"])
+    if disposition_col and disposition_col in df.columns:
+        return (
+            df.groupby(["Identifier_normalized", disposition_col])
+            .size()
+            .reset_index(name="Count")
+            .rename(columns={"Identifier_normalized": "Identifier"})
+        )
+    return pd.DataFrame()
+
+
+def build_duplicate_report(df):
+    candidates = ["CallId", "Call ID", "CallShaperLeadId", "Lead ID", "FromNumber", "Phone", "Phone Number"]
+    dup_frames = []
+    for candidate in candidates:
+        col = find_column(df, [candidate])
+        if col and col in df.columns:
+            temp = df[df[col].astype(str).str.strip() != ""].copy()
+            dups = temp[temp.duplicated(subset=[col], keep=False)].copy()
+            if not dups.empty:
+                dups.insert(0, "Duplicate Check Field", col)
+                dup_frames.append(dups)
+            break
+    if dup_frames:
+        return pd.concat(dup_frames, ignore_index=True)
+    return pd.DataFrame()
+
+
+def build_exception_report(merged_df, summary_df):
+    rows = []
+    if not summary_df.empty:
+        for _, row in summary_df.iterrows():
+            ident = normalize_text(row.get("Identifier", ""))
+            center = normalize_text(row.get("CenterName", ""))
+            email = normalize_text(row.get("Email", ""))
+            if not center:
+                rows.append({"Issue": "Unknown identifier", "Identifier": ident, "CenterName": center, "Email": email, "Details": "Identifier is not mapped to a Center Profile."})
+            if not email:
+                rows.append({"Issue": "Missing email", "Identifier": ident, "CenterName": center, "Email": email, "Details": "Center has no TeamEmail in Center Profiles."})
+
+    if "Identifier_normalized" in merged_df.columns:
+        missing_identifier = merged_df[merged_df["Identifier_normalized"].astype(str).str.strip() == ""]
+        if not missing_identifier.empty:
+            rows.append({"Issue": "Blank identifier", "Identifier": "", "CenterName": "", "Email": "", "Details": f"{len(missing_identifier)} row(s) have a blank identifier."})
+
+    return pd.DataFrame(rows, columns=["Issue", "Identifier", "CenterName", "Email", "Details"])
+
+
+def build_email_preview_df(vendor_files, test_mode, test_email):
+    rows = []
+    for item in vendor_files:
+        rows.append({
+            "CenterName": item["CenterName"],
+            "Identifier": item["Identifier"],
+            "ToEmail": test_email.strip() if test_mode else item["Email"],
+            "ActualEmail": item["Email"],
+            "CC": item["CC"],
+            "File": item["FileName"],
+            "TotalRows": item["TotalRows"],
+            "PayableY": item["PayableY"],
+            "Status": "READY" if (test_mode and test_email.strip()) or item["Email"] else "MISSING EMAIL"
+        })
+    return pd.DataFrame(rows)
+
+
+def build_center_workbook(center_name, identifier, report_name, export_df, center_history_df, disposition_df=None):
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    current_payable, current_not_payable = payable_counts(export_df)
+    total_rows = len(export_df)
+    conversion_rate = current_payable / total_rows if total_rows else 0
+
+    summary = pd.DataFrame([
+        {"Metric": "Report", "Value": report_name},
+        {"Metric": "Center", "Value": center_name},
+        {"Metric": "Identifier", "Value": identifier},
+        {"Metric": "Total Leads", "Value": total_rows},
+        {"Metric": "Payable Leads", "Value": current_payable},
+        {"Metric": "Not Payable", "Value": current_not_payable},
+        {"Metric": "Payable %", "Value": f"{conversion_rate:.1%}"},
+    ])
+    write_df_to_sheet(wb, "Summary", summary, title=f"{center_name or 'Center'} Performance Summary")
+
+    write_df_to_sheet(wb, "Current Leads", export_df, title=f"{report_name} - Current Leads")
+
+    history = center_history_df.copy() if isinstance(center_history_df, pd.DataFrame) else pd.DataFrame()
+    if not history.empty:
+        history = history.sort_values(by="Timestamp")
+        history["RunDate"] = pd.to_datetime(history["Timestamp"], errors="coerce").dt.strftime("%Y-%m-%d")
+        history["PayableRate"] = history.apply(
+            lambda row: (float(row.get("PayableLeads", 0)) / float(row.get("TotalRows", 0))) if float(row.get("TotalRows", 0) or 0) else 0,
+            axis=1
+        )
+        monthly = history[["RunDate", "ReportType", "TotalRows", "PayableLeads", "PayableRate"]].copy()
+    else:
+        monthly = pd.DataFrame([{
+            "RunDate": pd.Timestamp.now().strftime("%Y-%m-%d"),
+            "ReportType": report_name,
+            "TotalRows": total_rows,
+            "PayableLeads": current_payable,
+            "PayableRate": conversion_rate,
+        }])
+
+    ws_monthly = write_df_to_sheet(wb, "Monthly Performance", monthly, title="Performance Over Time")
+    for row in range(4, ws_monthly.max_row + 1):
+        try:
+            ws_monthly.cell(row, 5).number_format = "0.00%"
+        except Exception:
+            pass
+
+    if disposition_df is not None and not disposition_df.empty:
+        write_df_to_sheet(wb, "Disposition Summary", disposition_df, title="Disposition Breakdown")
+
+    charts = wb.create_sheet("Charts")
+    charts["A1"] = f"{center_name or 'Center'} Charts"
+    charts["A1"].font = Font(size=16, bold=True)
+    charts["A3"] = "RunDate"
+    charts["B3"] = "TotalRows"
+    charts["C3"] = "PayableLeads"
+    charts["D3"] = "PayableRate"
+    style_header_row(charts, 3)
+
+    for idx, row in enumerate(monthly.itertuples(index=False), 4):
+        charts.cell(idx, 1, getattr(row, "RunDate", ""))
+        charts.cell(idx, 2, float(getattr(row, "TotalRows", 0) or 0))
+        charts.cell(idx, 3, float(getattr(row, "PayableLeads", 0) or 0))
+        charts.cell(idx, 4, float(getattr(row, "PayableRate", 0) or 0))
+        charts.cell(idx, 4).number_format = "0.00%"
+
+    last = max(4, charts.max_row)
+
+    total_chart = LineChart()
+    total_chart.title = "Total Leads Over Time"
+    total_chart.y_axis.title = "Leads"
+    total_chart.x_axis.title = "Run Date"
+    total_chart.add_data(Reference(charts, min_col=2, min_row=3, max_row=last), titles_from_data=True)
+    total_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=last))
+    total_chart.height = 8
+    total_chart.width = 14
+    charts.add_chart(total_chart, "A8")
+
+    payable_chart = LineChart()
+    payable_chart.title = "Payable Leads Over Time"
+    payable_chart.y_axis.title = "Payable Leads"
+    payable_chart.x_axis.title = "Run Date"
+    payable_chart.add_data(Reference(charts, min_col=3, min_row=3, max_row=last), titles_from_data=True)
+    payable_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=last))
+    payable_chart.height = 8
+    payable_chart.width = 14
+    charts.add_chart(payable_chart, "I8")
+
+    rate_chart = LineChart()
+    rate_chart.title = "Payable Rate Over Time"
+    rate_chart.y_axis.title = "Payable %"
+    rate_chart.x_axis.title = "Run Date"
+    rate_chart.add_data(Reference(charts, min_col=4, min_row=3, max_row=last), titles_from_data=True)
+    rate_chart.set_categories(Reference(charts, min_col=1, min_row=4, max_row=last))
+    rate_chart.height = 8
+    rate_chart.width = 14
+    charts.add_chart(rate_chart, "A24")
+
+    if disposition_df is not None and not disposition_df.empty and "Count" in disposition_df.columns:
+        disp_start = 3
+        charts["F3"] = "Disposition"
+        charts["G3"] = "Count"
+        style_header_row(charts, 3)
+        disp_col = [c for c in disposition_df.columns if c not in ["Identifier", "Count"]]
+        label_col = disp_col[0] if disp_col else disposition_df.columns[0]
+        for r_idx, (_, disp_row) in enumerate(disposition_df.iterrows(), 4):
+            charts.cell(r_idx, 6, normalize_text(disp_row.get(label_col, "")))
+            charts.cell(r_idx, 7, int(disp_row.get("Count", 0) or 0))
+        pie_last = max(4, 3 + len(disposition_df))
+        pie = PieChart()
+        pie.title = "Disposition Breakdown"
+        pie.add_data(Reference(charts, min_col=7, min_row=3, max_row=pie_last), titles_from_data=True)
+        pie.set_categories(Reference(charts, min_col=6, min_row=4, max_row=pie_last))
+        pie.height = 8
+        pie.width = 14
+        charts.add_chart(pie, "I24")
+
+    apply_excel_widths(charts)
+    return wb
+
+
+def build_admin_review_workbook(config, raw_df, merged_df, summary_df, email_preview_df, missing_email_df, unknown_identifier_df, duplicate_df, disposition_summary, exception_df):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Dashboard"
+    ws["A1"] = f"{config['report_name']} Admin Review"
+    ws["A1"].font = Font(size=18, bold=True)
+
+    total_rows = int(summary_df["TotalRows"].sum()) if not summary_df.empty else 0
+    total_payable = int(summary_df["PayableY"].sum()) if not summary_df.empty else 0
+    total_centers = len(summary_df)
+    missing_count = len(missing_email_df) if isinstance(missing_email_df, pd.DataFrame) else 0
+    unknown_count = len(unknown_identifier_df) if isinstance(unknown_identifier_df, pd.DataFrame) else 0
+    duplicate_count = len(duplicate_df) if isinstance(duplicate_df, pd.DataFrame) else 0
+
+    dashboard_rows = [
+        ("Report", config["report_name"]),
+        ("Generated At", pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Total Centers", total_centers),
+        ("Total Leads", total_rows),
+        ("Payable Leads", total_payable),
+        ("Payable %", f"{(total_payable / total_rows):.1%}" if total_rows else "0.0%"),
+        ("Missing Email Centers", missing_count),
+        ("Unknown Identifier Rows", unknown_count),
+        ("Duplicate Rows Flagged", duplicate_count),
+        ("Status", "REVIEW REQUIRED BEFORE SENDING"),
+    ]
+    for r, (label, value) in enumerate(dashboard_rows, 3):
+        ws.cell(r, 1, label).font = Font(bold=True)
+        ws.cell(r, 2, value)
+    apply_excel_widths(ws)
+
+    write_df_to_sheet(wb, "Center Summary", summary_df, title="Center Summary")
+    write_df_to_sheet(wb, "Email Queue", email_preview_df, title="Email Queue Preview")
+    write_df_to_sheet(wb, "Missing Emails", missing_email_df, title="Missing Emails")
+    write_df_to_sheet(wb, "Unknown Identifiers", unknown_identifier_df, title="Unknown Identifiers")
+    write_df_to_sheet(wb, "Duplicate Leads", duplicate_df, title="Duplicate Leads")
+    write_df_to_sheet(wb, "Payable Audit", merged_df[[c for c in merged_df.columns if c in ["Identifier_normalized", "FinalCenterName", "Payable", "Payable Audit Reason", "Payable Duration Seconds"]]], title="Payable Audit")
+    if not disposition_summary.empty:
+        write_df_to_sheet(wb, "Disposition Summary", disposition_summary, title="Disposition Summary")
+    write_df_to_sheet(wb, "Exceptions", exception_df, title="Exception Report")
+    write_df_to_sheet(wb, "Raw Import", raw_df, title="Raw Uploaded Detail")
+
+    # Add a sheet per center for admin review.
+    for identifier_value, group in merged_df.groupby("Identifier_normalized"):
+        center_name = normalize_text(group["FinalCenterName"].iloc[0]) if "FinalCenterName" in group.columns else ""
+        label = center_name or identifier_value or "Unknown Center"
+        write_df_to_sheet(wb, f"{label[:20]}", group, title=f"{label} Detail")
+
+    return wb
+
+
+def process_report_package(uploaded_file, config, test_mode, test_email):
+    raw_df = prepare_uploaded_detail(uploaded_file, config)
+    detail_df = apply_payable_rule(raw_df, config)
+
+    id_col = find_column(detail_df, [config["identifier_label"], config["identifier_label"].replace(" ", "")])
+    if id_col is None:
+        raise ValueError(f"Could not find {config['identifier_label']} in the uploaded file.")
+
+    paidamount_col = find_column(detail_df, ["PaidAmount", "Paid Amount"])
+    profiles_df = load_center_profiles()
+    profile_lookup = build_profile_lookup(profiles_df, config["profile_identifier_col"])
+    merged_df = merge_with_profile_lookup(detail_df, id_col, profile_lookup)
+
+    summary_rows = []
+    vendor_files = []
+    center_logs_df = load_center_logs()
+    disposition_summary = build_disposition_summary(merged_df)
+
+    for identifier_value, group in merged_df.groupby("Identifier_normalized", dropna=False):
+        center_name = normalize_text(group["FinalCenterName"].iloc[0]) if "FinalCenterName" in group.columns else ""
+        email = normalize_text(group["FinalEmail"].iloc[0]) if "FinalEmail" in group.columns else ""
+        payable_y, payable_n = payable_counts(group)
+        total_paid = 0.0
+        if paidamount_col and paidamount_col in group.columns:
+            total_paid = float(pd.to_numeric(group[paidamount_col], errors="coerce").fillna(0).sum())
+
+        summary_rows.append({
+            "Identifier": identifier_value,
+            "CenterName": center_name,
+            "Email": email,
+            "CC": CC_EMAIL,
+            "TotalRows": len(group),
+            "PayableY": payable_y,
+            "PayableN": payable_n,
+            "TotalPaidAmount": total_paid,
+            "ReadyToSend": "Yes" if email else "No"
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(by=["CenterName", "Identifier"], na_position="last")
+
+    missing_email_df = summary_df[summary_df["Email"].astype(str).str.strip() == ""].copy() if not summary_df.empty else pd.DataFrame()
+    unknown_identifier_df = merged_df[merged_df["FinalCenterName"].astype(str).str.strip() == ""].copy() if "FinalCenterName" in merged_df.columns else pd.DataFrame()
+    duplicate_df = build_duplicate_report(merged_df)
+    exception_df = build_exception_report(merged_df, summary_df)
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for identifier_value, group in merged_df.groupby("Identifier_normalized", dropna=False):
+            center_name = normalize_text(group["FinalCenterName"].iloc[0]) if "FinalCenterName" in group.columns else ""
+            email = normalize_text(group["FinalEmail"].iloc[0]) if "FinalEmail" in group.columns else ""
+            safe_identifier = sanitize_filename(identifier_value)
+            safe_center = sanitize_filename(center_name) if center_name else "UnknownCenter"
+            export_group = remove_final_report_columns(group, config)
+
+            center_history = pd.DataFrame()
+            if not center_logs_df.empty:
+                center_history = center_logs_df[
+                    (center_logs_df["Identifier"].astype(str) == str(identifier_value))
+                    & (center_logs_df["ReportType"].astype(str) == config["report_name"])
+                ].copy()
+
+            center_disposition = pd.DataFrame()
+            if not disposition_summary.empty:
+                center_disposition = disposition_summary[disposition_summary["Identifier"].astype(str) == str(identifier_value)].copy()
+
+            wb = build_center_workbook(
+                center_name=center_name or safe_identifier,
+                identifier=identifier_value,
+                report_name=config["report_name"],
+                export_df=export_group,
+                center_history_df=center_history,
+                disposition_df=center_disposition,
+            )
+            workbook_bytes = df_to_excel_bytes(wb)
+            workbook_name = f"{safe_center}__{safe_identifier}.xlsx"
+            zip_file.writestr(workbook_name, workbook_bytes)
+
+            vendor_files.append({
+                "Identifier": identifier_value,
+                "CenterName": center_name,
+                "Email": email,
+                "CC": CC_EMAIL,
+                "FileName": workbook_name,
+                "FileBytes": workbook_bytes,
+                "TotalRows": len(group),
+                "PayableY": payable_counts(group)[0],
+            })
+
+        zip_file.writestr("center_summary.csv", summary_df.to_csv(index=False).encode("utf-8"))
+        if not disposition_summary.empty:
+            zip_file.writestr("disposition_summary.csv", disposition_summary.to_csv(index=False).encode("utf-8"))
+
+    zip_buffer.seek(0)
+    email_preview_df = build_email_preview_df(vendor_files, test_mode, test_email)
+    admin_wb = build_admin_review_workbook(
+        config, raw_df, merged_df, summary_df, email_preview_df,
+        missing_email_df, unknown_identifier_df, duplicate_df, disposition_summary, exception_df
+    )
+    admin_workbook_bytes = df_to_excel_bytes(admin_wb)
+
+    total_centers = len(summary_df)
+    total_rows = int(summary_df["TotalRows"].sum()) if not summary_df.empty else 0
+    total_payable = int(summary_df["PayableY"].sum()) if not summary_df.empty else 0
+    ready_count = int((summary_df["ReadyToSend"] == "Yes").sum()) if not summary_df.empty else 0
+
+    return {
+        "config": config,
+        "raw_df": raw_df,
+        "merged_df": merged_df,
+        "summary_df": summary_df,
+        "missing_email_df": missing_email_df,
+        "unknown_identifier_df": unknown_identifier_df,
+        "duplicate_df": duplicate_df,
+        "disposition_summary": disposition_summary,
+        "exception_df": exception_df,
+        "email_preview_df": email_preview_df,
+        "vendor_files": vendor_files,
+        "zip_bytes": zip_buffer.getvalue(),
+        "admin_workbook_bytes": admin_workbook_bytes,
+        "total_centers": total_centers,
+        "total_rows": total_rows,
+        "total_payable": total_payable,
+        "ready_count": ready_count,
+    }
+
+
+def send_vendor_workbook_emails(vendor_files, sender_email, gmail_app_password, test_mode, test_email, report_name):
+    server = smtplib.SMTP("smtp.gmail.com", 587)
+    server.starttls()
+    server.login(sender_email, gmail_app_password)
+    sent_count = 0
+    send_log = []
+
+    try:
+        for item in vendor_files:
+            if not test_mode and not item["Email"]:
+                send_log.append({**item, "EmailStatus": "SKIPPED - Missing email"})
+                continue
+
+            if test_mode and not test_email.strip():
+                send_log.append({**item, "EmailStatus": "SKIPPED - Missing test email"})
+                continue
+
+            to_email = test_email.strip() if test_mode else item["Email"]
+            msg = EmailMessage()
+            msg["Subject"] = build_email_subject(item["CenterName"], item["Identifier"], report_name)
+            msg["From"] = sender_email
+            msg["To"] = to_email
+            msg["CC"] = item["CC"]
+            msg.set_content(build_email_body(item["CenterName"], item["Identifier"], item["TotalRows"], item["PayableY"], report_name))
+            msg.add_attachment(
+                item["FileBytes"],
+                maintype="application",
+                subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                filename=item["FileName"],
+            )
+            server.send_message(msg)
+            sent_count += 1
+            send_log.append({**item, "EmailStatus": f"SENT to {to_email}"})
+    finally:
+        server.quit()
+
+    clean_log = []
+    for row in send_log:
+        clean_log.append({k: v for k, v in row.items() if k not in ["FileBytes"]})
+    return sent_count, pd.DataFrame(clean_log)
+
+
+def render_report_page(config):
+    report_key = config["report_key"]
+    report_name = config["report_name"]
+    file_type = config["file_type"]
+
+    back_col, title_col = st.columns([1, 6])
     with back_col:
         if st.button("← Back", key=f"back_{report_key}", width="stretch"):
             go_to("dashboard")
-
     with title_col:
         st.markdown(
             f"""
@@ -1086,7 +1667,7 @@ def render_report_page(
                 {report_name}
             </div>
             <div style="font-size: 15px; color: #6b7280; margin-top: 4px; margin-bottom: 16px;">
-                Run report, review results, use center profiles for mapping, and send files.
+                Generate a review package, preview results, approve, then send center performance workbooks.
             </div>
             """,
             unsafe_allow_html=True
@@ -1096,17 +1677,16 @@ def render_report_page(
 
     with page_tab2:
         profiles_df = load_center_profiles()
-        cols_to_show = ["CenterName", "TeamEmail", profile_identifier_col, "ContactPerson", "Notes", "Active"]
+        cols_to_show = ["CenterName", "TeamEmail", config["profile_identifier_col"], "ContactPerson", "Notes", "Active"]
         cols_to_show = [c for c in cols_to_show if c in profiles_df.columns]
         st.subheader(f"{report_name} Profile Mapping View")
         st.dataframe(profiles_df[cols_to_show], width="stretch")
-        st.caption(f"This report uses `{profile_identifier_col}` from Center Profiles as its mapping source.")
+        st.caption(f"This report uses `{config['profile_identifier_col']}` from Center Profiles as its mapping source.")
         if st.button("Open Full Center Profiles", key=f"profiles_jump_{report_key}", width="stretch"):
             go_to("profiles")
 
     with page_tab1:
         controls_left, controls_mid, controls_right = st.columns([1, 1, 2])
-
         with controls_left:
             test_mode = st.checkbox("Test Mode", value=True, key=f"{report_key}_test_mode")
         with controls_mid:
@@ -1124,6 +1704,17 @@ def render_report_page(
             key=f"{report_key}_uploader"
         )
 
+        package_key = f"{report_key}_report_package"
+        approval_key = f"{report_key}_admin_approved"
+        signature_key = f"{report_key}_upload_signature"
+
+        if uploaded_file is not None:
+            signature = f"{uploaded_file.name}_{uploaded_file.size}"
+            if st.session_state.get(signature_key) != signature:
+                st.session_state[signature_key] = signature
+                st.session_state[package_key] = None
+                st.session_state[approval_key] = False
+
         if uploaded_file is None:
             st.info(f"Upload a file to begin the {report_name.lower()} workflow.")
             return
@@ -1131,319 +1722,155 @@ def render_report_page(
         if not validate_uploaded_file(uploaded_file, file_type, report_name):
             return
 
-        try:
-            detail_df = pd.DataFrame()
-            raw_preview_df = pd.DataFrame()
-
-            if file_type == "excel":
-                try:
-                    xls = pd.ExcelFile(uploaded_file)
-                except Exception as e:
-                    st.error(f"Could not open this Excel file: {e}")
-                    st.info("Please make sure you uploaded a valid Excel workbook.")
-                    return
-
-                detail_sheet = None
-                for sheet in xls.sheet_names:
-                    if "detail" in sheet.strip().lower():
-                        detail_sheet = sheet
-                        break
-
-                if detail_sheet is None:
-                    st.error("Could not find the Detail sheet in this workbook.")
-                    st.info("Please upload the original report workbook that includes a Detail tab.")
-                    return
-
-                detail_df = pd.read_excel(uploaded_file, sheet_name=detail_sheet)
-                raw_preview_df = detail_df.copy()
-
-            else:
-                try:
-                    detail_df = pd.read_csv(uploaded_file)
-                    raw_preview_df = detail_df.copy()
-                except Exception as e:
-                    st.error(f"Could not open this CSV file: {e}")
-                    st.info("Please make sure you uploaded a valid CSV export.")
-                    return
-
-            id_col = find_column(detail_df, [identifier_label, identifier_label.replace(" ", "")])
-            if id_col is None:
-                st.error(f"Could not find {identifier_label} in the uploaded file.")
+        if st.button("Generate Review Package", key=f"{report_key}_generate_package", type="primary", width="stretch"):
+            try:
+                package = process_report_package(uploaded_file, config, test_mode, test_email)
+                st.session_state[package_key] = package
+                st.session_state[approval_key] = False
+                st.success("Review package generated. Emails are locked until admin approval.")
+            except Exception as e:
+                st.session_state[package_key] = None
+                st.session_state[approval_key] = False
+                st.error(f"Something went wrong while processing this file: {e}")
+                st.info("Please verify that you uploaded the correct report file and that the expected columns are present.")
                 return
 
-            disposition_col = find_column(detail_df, ["Disposition"])
-            paidamount_col = find_column(detail_df, ["PaidAmount", "Paid Amount"])
+        package = st.session_state.get(package_key)
+        if not package:
+            return
 
-            if custom_payable_rule == "ecp":
-                duration_col = find_column(detail_df, ["Duration"])
-                if duration_col is None or disposition_col is None:
-                    st.error("ECP requires both Duration and Disposition columns to calculate Payable.")
-                    return
+        total_centers = package["total_centers"]
+        total_rows = package["total_rows"]
+        total_payable = package["total_payable"]
+        ready_count = package["ready_count"]
+        conversion_rate = f"{(total_payable / total_rows * 100):.1f}%" if total_rows > 0 else "0.0%"
 
-                detail_df["Payable"] = detail_df.apply(
-                    lambda row: "Y"
-                    if normalize_text(row[disposition_col]).lower() == "transfer sale"
-                    and pd.to_numeric(row[duration_col], errors="coerce") >= 120
-                    else "N",
-                    axis=1
-                )
+        m1, m2, m3, m4, m5 = st.columns(5)
+        with m1:
+            metric_card("Centers", total_centers)
+        with m2:
+            metric_card("Total Leads", total_rows)
+        with m3:
+            metric_card("Payable Leads", total_payable)
+        with m4:
+            metric_card("Conversion Rate", conversion_rate)
+        with m5:
+            metric_card("Ready to Send", ready_count)
 
-            profiles_df = load_center_profiles()
-            profile_lookup = build_profile_lookup(profiles_df, profile_identifier_col)
-            merged_df = merge_with_profile_lookup(detail_df, id_col, profile_lookup)
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Admin Review", "Downloads", "Email Queue", "Raw Preview", "Exceptions"])
 
-            summary_rows = []
+        with tab1:
+            st.subheader("Admin Review Required")
+            st.warning("Emails are locked until the review workbook and on-screen previews are approved.")
+            st.dataframe(package["summary_df"], width="stretch")
+            if not package["disposition_summary"].empty:
+                st.subheader("Disposition Summary")
+                st.dataframe(package["disposition_summary"], width="stretch")
 
-            for identifier_value, group in merged_df.groupby("Identifier_normalized"):
-                payable_y = 0
-                payable_n = 0
-                total_paid = 0.0
+            reviewed_preview = st.checkbox("I reviewed the on-screen summary and email queue.", key=f"{report_key}_reviewed_preview")
+            reviewed_workbook = st.checkbox("I downloaded/reviewed the admin workbook or ZIP package.", key=f"{report_key}_reviewed_workbook")
+            approve_disabled = not (reviewed_preview and reviewed_workbook)
 
-                payable_col = find_column(group, ["Payable"])
-                if payable_col:
-                    payable_series = group[payable_col].astype(str).str.strip().str.upper()
-                    payable_y = int((payable_series == "Y").sum())
-                    payable_n = int((payable_series == "N").sum())
+            if st.button("Approve Batch for Sending", key=f"{report_key}_approve_batch", type="primary", width="stretch", disabled=approve_disabled):
+                st.session_state[approval_key] = True
+                st.success("Batch approved. Email sending is now unlocked.")
 
-                if paidamount_col and paidamount_col in group.columns:
-                    total_paid = float(pd.to_numeric(group[paidamount_col], errors="coerce").fillna(0).sum())
+            if st.button("Reset Approval", key=f"{report_key}_reset_approval", width="stretch"):
+                st.session_state[approval_key] = False
+                st.warning("Approval reset. Emails are locked again.")
 
-                center_name = normalize_text(group["FinalCenterName"].iloc[0]) if "FinalCenterName" in group.columns else ""
-                email = normalize_text(group["FinalEmail"].iloc[0]) if "FinalEmail" in group.columns else ""
-
-                summary_rows.append({
-                    "Identifier": identifier_value,
-                    "CenterName": center_name,
-                    "Email": email,
-                    "CC": CC_EMAIL,
-                    "TotalRows": len(group),
-                    "PayableY": payable_y,
-                    "PayableN": payable_n,
-                    "TotalPaidAmount": total_paid,
-                    "ReadyToSend": "Yes" if email else "No"
-                })
-
-            summary_df = pd.DataFrame(summary_rows)
-            if not summary_df.empty:
-                summary_df = summary_df.sort_values(by=["CenterName", "Identifier"], na_position="last")
-
-            if disposition_col and disposition_col in merged_df.columns:
-                disposition_summary = (
-                    merged_df.groupby(["Identifier_normalized", disposition_col])
-                    .size()
-                    .reset_index(name="Count")
-                    .rename(columns={"Identifier_normalized": "Identifier"})
-                )
+            if st.session_state.get(approval_key):
+                st.success("ADMIN APPROVAL COMPLETE - email sending is unlocked.")
             else:
-                disposition_summary = pd.DataFrame()
+                st.error("ADMIN APPROVAL REQUIRED - email sending is locked.")
 
-            missing_email_df = pd.DataFrame()
-            if not summary_df.empty:
-                missing_email_df = summary_df[summary_df["Email"].astype(str).str.strip() == ""]
+        with tab2:
+            st.subheader("Downloads")
+            st.download_button(
+                label="Download Admin Review Workbook",
+                data=package["admin_workbook_bytes"],
+                file_name=f"{report_key}_admin_review_workbook.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch"
+            )
+            st.download_button(
+                label="Download ZIP of all center workbooks",
+                data=package["zip_bytes"],
+                file_name=f"{report_key}_center_workbooks.zip",
+                mime="application/zip",
+                width="stretch"
+            )
+            st.download_button(
+                label="Download center summary CSV",
+                data=package["summary_df"].to_csv(index=False).encode("utf-8"),
+                file_name=f"{report_key}_center_summary.csv",
+                mime="text/csv",
+                width="stretch"
+            )
 
-            zip_buffer = io.BytesIO()
-            vendor_files = []
+        with tab3:
+            st.subheader("Email Queue")
+            st.dataframe(package["email_preview_df"], width="stretch")
 
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                for identifier_value, group in merged_df.groupby("Identifier_normalized"):
-                    center_name = normalize_text(group["FinalCenterName"].iloc[0]) if "FinalCenterName" in group.columns else ""
-                    email = normalize_text(group["FinalEmail"].iloc[0]) if "FinalEmail" in group.columns else ""
-
-                    safe_identifier = sanitize_filename(identifier_value)
-                    safe_center = sanitize_filename(center_name) if center_name else "UnknownCenter"
-
-                    cols_to_remove = [
-                        "Identifier_normalized",
-                        "Identifier",
-                        "CenterName",
-                        "Email",
-                        "FinalCenterName",
-                        "FinalEmail",
-                        "ProfileNotes",
-                        "ContactPerson"
-                    ] + remove_columns
-
-                    export_group = group.drop(columns=cols_to_remove, errors="ignore")
-
-                    csv_bytes = export_group.to_csv(index=False).encode("utf-8")
-                    csv_filename = f"{safe_center}__{safe_identifier}.csv"
-                    zip_file.writestr(csv_filename, csv_bytes)
-
-                    payable_col = find_column(group, ["Payable"])
-                    payable_y = 0
-                    if payable_col and payable_col in group.columns:
-                        payable_series = group[payable_col].astype(str).str.strip().str.upper()
-                        payable_y = int((payable_series == "Y").sum())
-
-                    vendor_files.append({
-                        "Identifier": identifier_value,
-                        "CenterName": center_name,
-                        "Email": email,
-                        "CC": CC_EMAIL,
-                        "FileName": csv_filename,
-                        "CSVBytes": csv_bytes,
-                        "TotalRows": len(group),
-                        "PayableY": payable_y
-                    })
-
-                zip_file.writestr("center_summary.csv", summary_df.to_csv(index=False).encode("utf-8"))
-                if not disposition_summary.empty:
-                    zip_file.writestr("disposition_summary.csv", disposition_summary.to_csv(index=False).encode("utf-8"))
-
-            zip_buffer.seek(0)
-
-            total_centers = len(summary_df)
-            total_rows = int(summary_df["TotalRows"].sum()) if not summary_df.empty else 0
-            total_payable = int(summary_df["PayableY"].sum()) if not summary_df.empty else 0
-            ready_count = int((summary_df["ReadyToSend"] == "Yes").sum()) if not summary_df.empty else 0
-            conversion_rate = f"{(total_payable / total_rows * 100):.1f}%" if total_rows > 0 else "0.0%"
-
-            m1, m2, m3, m4, m5 = st.columns(5)
-            with m1:
-                metric_card("Centers", total_centers)
-            with m2:
-                metric_card("Total Leads", total_rows)
-            with m3:
-                metric_card("Payable Leads", total_payable)
-            with m4:
-                metric_card("Conversion Rate", conversion_rate)
-            with m5:
-                metric_card("Ready to Send", ready_count)
-
-            tab1, tab2, tab3, tab4 = st.tabs(["Review", "Downloads", "Email Queue", "Raw Preview"])
-
-            with tab1:
-                st.subheader("Center Summary")
-                st.dataframe(summary_df, width="stretch")
-
-                if not missing_email_df.empty:
-                    st.warning("Some centers are missing emails in Center Profiles.")
-                    st.dataframe(missing_email_df, width="stretch")
-
-                if not disposition_summary.empty:
-                    st.subheader("Disposition Summary")
-                    st.dataframe(disposition_summary, width="stretch")
-
-            with tab2:
-                st.subheader("Downloads")
-                st.download_button(
-                    label="Download ZIP of all center CSV files",
-                    data=zip_buffer,
-                    file_name=f"{report_key}_split_reports.zip",
-                    mime="application/zip",
-                    width="stretch"
-                )
-                st.download_button(
-                    label="Download center summary CSV",
-                    data=summary_df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{report_key}_center_summary.csv",
-                    mime="text/csv",
-                    width="stretch"
+            live_confirm = False
+            if not test_mode:
+                live_confirm = st.checkbox(
+                    "I confirm I want to send emails to live vendor addresses.",
+                    key=f"{report_key}_live_confirm"
                 )
 
-            with tab3:
-                st.subheader("Email Queue")
+            send_disabled = False
+            if not st.session_state.get(approval_key, False):
+                send_disabled = True
+                st.warning("Admin approval is required before emails can be sent.")
+            if test_mode and not test_email.strip():
+                send_disabled = True
+                st.info("Enter a test email to enable sending in Test Mode.")
+            if not test_mode and not live_confirm:
+                send_disabled = True
+                st.warning("Live sending requires confirmation before emails can be sent.")
 
-                email_preview_rows = []
-                for item in vendor_files:
-                    email_preview_rows.append({
-                        "CenterName": item["CenterName"],
-                        "ToEmail": test_email.strip() if test_mode else item["Email"],
-                        "CC": item["CC"],
-                        "File": item["FileName"],
-                        "TotalRows": item["TotalRows"],
-                        "PayableY": item["PayableY"],
-                        "Status": "READY" if (test_mode and test_email.strip()) or item["Email"] else "MISSING EMAIL"
-                    })
-
-                email_preview_df = pd.DataFrame(email_preview_rows)
-                st.dataframe(email_preview_df, width="stretch")
-
-                live_confirm = False
-                if not test_mode:
-                    live_confirm = st.checkbox(
-                        "I confirm I want to send emails to live vendor addresses.",
-                        key=f"{report_key}_live_confirm"
+            send_label = "Send TEST Emails" if test_mode else "Send LIVE Emails"
+            if st.button(send_label, key=f"{report_key}_send_emails", type="primary", width="stretch", disabled=send_disabled):
+                try:
+                    sent_count, send_log_df = send_vendor_workbook_emails(
+                        vendor_files=package["vendor_files"],
+                        sender_email=sender_email,
+                        gmail_app_password=gmail_app_password,
+                        test_mode=test_mode,
+                        test_email=test_email,
+                        report_name=report_name,
                     )
-
-                send_disabled = False
-                if test_mode and not test_email.strip():
-                    send_disabled = True
-                    st.info("Enter a test email to enable sending in Test Mode.")
-
-                if not test_mode and not live_confirm:
-                    send_disabled = True
-                    st.warning("Live sending requires confirmation before emails can be sent.")
-
-                if st.button("Send Emails", key=f"{report_key}_send_emails", type="primary", width="stretch", disabled=send_disabled):
+                    st.success(f"Sent {sent_count} emails successfully.")
+                    st.dataframe(send_log_df, width="stretch")
+                    mode_value = "TEST" if test_mode else "LIVE"
+                    log_report_run(report_name, total_rows, total_payable, total_centers, sent_count, mode_value, len(package["missing_email_df"]))
+                    log_center_runs(report_name, package["summary_df"], mode_value)
+                    if len(package["missing_email_df"]) > 0:
+                        log_error_event(report_name, "Missing Emails", f"{len(package['missing_email_df'])} centers missing emails", len(package["missing_email_df"]), mode_value)
+                    st.session_state[approval_key] = False
+                except Exception as e:
                     try:
-                        sent_count = send_vendor_emails(
-                            vendor_files=vendor_files,
-                            sender_email=sender_email,
-                            gmail_app_password=gmail_app_password,
-                            test_mode=test_mode,
-                            test_email=test_email,
-                            report_name=report_name
-                        )
+                        log_error_event(report_name, "Email Send Failure", str(e), 1, "TEST" if test_mode else "LIVE")
+                    except Exception:
+                        pass
+                    st.error(f"Email error: {e}")
 
-                        st.success(f"Sent {sent_count} emails successfully.")
+        with tab4:
+            st.subheader("Raw Preview")
+            st.dataframe(package["raw_df"].head(50), width="stretch")
 
-                        mode_value = "TEST" if test_mode else "LIVE"
+        with tab5:
+            st.subheader("Exceptions")
+            if package["exception_df"].empty:
+                st.success("No exceptions found.")
+            else:
+                st.dataframe(package["exception_df"], width="stretch")
+            if not package["duplicate_df"].empty:
+                st.subheader("Duplicate Leads")
+                st.dataframe(package["duplicate_df"].head(200), width="stretch")
 
-                        try:
-                            log_report_run(
-                                report_type=report_name,
-                                total_rows=total_rows,
-                                payable_leads=total_payable,
-                                centers=total_centers,
-                                emails_sent=sent_count,
-                                mode=mode_value,
-                                missing_emails=len(missing_email_df)
-                            )
-
-                            log_center_runs(
-                                report_type=report_name,
-                                summary_df=summary_df,
-                                mode=mode_value
-                            )
-
-                            if len(missing_email_df) > 0:
-                                log_error_event(
-                                    report_type=report_name,
-                                    error_type="Missing Emails",
-                                    details=f"{len(missing_email_df)} centers missing emails",
-                                    count=len(missing_email_df),
-                                    mode=mode_value
-                                )
-
-                            st.rerun()
-
-                        except Exception as log_error:
-                            st.warning(f"Run completed, but dashboard logging could not be written to Google Sheets: {log_error}")
-
-                    except Exception as e:
-                        try:
-                            log_error_event(
-                                report_type=report_name,
-                                error_type="Email Send Failure",
-                                details=str(e),
-                                count=1,
-                                mode="TEST" if test_mode else "LIVE"
-                            )
-                        except Exception:
-                            pass
-                        st.error(f"Email error: {e}")
-
-            with tab4:
-                st.subheader("Raw Preview")
-                st.dataframe(raw_preview_df.head(20), width="stretch")
-
-            st.info(f"This report maps `{identifier_label}` to `{profile_identifier_col}` in Center Profiles.")
-
-        except Exception as e:
-            st.error(f"Something went wrong while processing this file: {e}")
-            st.info("Please verify that you uploaded the correct report file and that the expected columns are present.")
-
+        st.info(f"This report maps `{config['identifier_label']}` to `{config['profile_identifier_col']}` in Center Profiles.")
 
 # =========================
 # SESSION + SECRETS
@@ -1550,49 +1977,5 @@ elif current_page == "profiles":
 elif current_page == "profile_detail":
     render_center_profile_detail_page()
 
-elif current_page == "cgm":
-    render_report_page(
-        report_key="cgm",
-        report_name="CGM Report",
-        identifier_label="LeadSource",
-        profile_identifier_col="CGMIdentifier",
-        file_type="excel",
-        remove_columns=[
-            "PaidAmount",
-            "Paid Amount",
-            "DiabeticOnMedicare",
-            "Diabetic On Medicare",
-            "AssignedTo",
-            "Assigned To"
-        ],
-        custom_payable_rule=None
-    )
-
-elif current_page == "ecp":
-    render_report_page(
-        report_key="ecp",
-        report_name="ECP Report",
-        identifier_label="Sub Id",
-        profile_identifier_col="ECPIdentifier",
-        file_type="csv",
-        remove_columns=[],
-        custom_payable_rule="ecp"
-    )
-
-elif current_page == "medadv":
-    render_report_page(
-        report_key="medadv",
-        report_name="Med Advantage Report",
-        identifier_label="LeadSource",
-        profile_identifier_col="MAIdentifier",
-        file_type="excel",
-        remove_columns=[
-            "PaidAmount",
-            "Paid Amount",
-            "DiabeticOnMedicare",
-            "Diabetic On Medicare",
-            "AssignedTo",
-            "Assigned To"
-        ],
-        custom_payable_rule=None
-    )
+elif current_page in REPORT_CONFIGS:
+    render_report_page(REPORT_CONFIGS[current_page])
