@@ -1,4 +1,7 @@
 import io
+import os
+import html
+import mimetypes
 import smtplib
 import zipfile
 from copy import copy
@@ -136,9 +139,61 @@ Payable Leads: {payable_y}
 
 Please review and let us know if you have any questions.
 
-Best,
-Dean
+Continued Success,
+LivMed Admin
 """
+
+
+def build_email_html_body(center_name, identifier, total_rows, payable_y, report_name, logo_cid="livmed-logo"):
+    center_name = html.escape(normalize_text(center_name) or "Team")
+    identifier = html.escape(normalize_text(identifier))
+    report_name = html.escape(normalize_text(report_name))
+    total_rows = html.escape(str(total_rows))
+    payable_y = html.escape(str(payable_y))
+
+    return f"""
+    <html>
+      <body style="font-family: Arial, Helvetica, sans-serif; color: #111827; font-size: 14px; line-height: 1.45;">
+        <p>Hello {center_name},</p>
+        <p>Attached is your {report_name.lower()}.</p>
+        <p>
+          <strong>Identifier:</strong> {identifier}<br>
+          <strong>Total Records:</strong> {total_rows}<br>
+          <strong>Payable Leads:</strong> {payable_y}
+        </p>
+        <p>Please review and let us know if you have any questions.</p>
+        <br>
+        <p style="margin-bottom: 4px;">Continued Success,</p>
+        <p style="font-weight: 700; font-size: 16px; margin-top: 0; margin-bottom: 14px;">LivMed Admin</p>
+        <img src="cid:{logo_cid}" alt="LivMed Corporation" style="width: 260px; max-width: 100%; height: auto; display: block;">
+      </body>
+    </html>
+    """
+
+
+def add_livmed_signature_email_body(msg, center_name, identifier, total_rows, payable_y, report_name):
+    """Adds both plain-text and HTML email bodies with LivMed signature/logo."""
+    plain_body = build_email_body(center_name, identifier, total_rows, payable_y, report_name)
+    msg.set_content(plain_body)
+
+    logo_cid = "livmed-logo"
+    html_body = build_email_html_body(center_name, identifier, total_rows, payable_y, report_name, logo_cid=logo_cid)
+    msg.add_alternative(html_body, subtype="html")
+
+    logo_path = LOGO_FILE
+    if os.path.exists(logo_path):
+        ctype, _ = mimetypes.guess_type(logo_path)
+        if ctype is None:
+            ctype = "image/png"
+        maintype, subtype = ctype.split("/", 1)
+        with open(logo_path, "rb") as logo_file:
+            msg.get_payload()[-1].add_related(
+                logo_file.read(),
+                maintype=maintype,
+                subtype=subtype,
+                cid=f"<{logo_cid}>",
+                filename=os.path.basename(logo_path),
+            )
 
 
 def metric_card(label, value):
@@ -499,14 +554,13 @@ def send_vendor_emails(vendor_files, sender_email, gmail_app_password, test_mode
         msg["From"] = sender_email
         msg["To"] = to_email
         msg["CC"] = item["CC"]
-        msg.set_content(
-            build_email_body(
-                item["CenterName"],
-                item["Identifier"],
-                item["TotalRows"],
-                item["PayableY"],
-                report_name
-            )
+        add_livmed_signature_email_body(
+            msg,
+            item["CenterName"],
+            item["Identifier"],
+            item["TotalRows"],
+            item["PayableY"],
+            report_name,
         )
 
         msg.add_attachment(
@@ -1310,7 +1364,33 @@ def build_email_preview_df(vendor_files, test_mode, test_email):
     return pd.DataFrame(rows)
 
 
+def sort_payables_first(df):
+    """Returns a copy sorted so Payable = Y leads appear at the top of center-facing reports."""
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    sorted_df = df.copy()
+    payable_col = find_column(sorted_df, ["Payable"])
+    if not payable_col or payable_col not in sorted_df.columns:
+        return sorted_df.reset_index(drop=True)
+
+    sorted_df["__PayableSort"] = sorted_df[payable_col].astype(str).str.strip().str.upper().map({"Y": 0, "N": 1}).fillna(2)
+
+    secondary_cols = []
+    duration_col = find_column(sorted_df, ["Duration"])
+    if duration_col and duration_col in sorted_df.columns:
+        sorted_df["__DurationSort"] = pd.to_numeric(sorted_df[duration_col], errors="coerce").fillna(0)
+        secondary_cols.append("__DurationSort")
+
+    sort_cols = ["__PayableSort"] + secondary_cols
+    ascending = [True] + [False for _ in secondary_cols]
+    sorted_df = sorted_df.sort_values(by=sort_cols, ascending=ascending, kind="mergesort")
+    sorted_df = sorted_df.drop(columns=[c for c in ["__PayableSort", "__DurationSort"] if c in sorted_df.columns])
+    return sorted_df.reset_index(drop=True)
+
+
 def build_center_workbook(center_name, identifier, report_name, export_df, center_history_df, disposition_df=None):
+    export_df = sort_payables_first(export_df)
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -1476,7 +1556,7 @@ def build_admin_review_workbook(config, raw_df, merged_df, summary_df, email_pre
     for identifier_value, group in merged_df.groupby("Identifier_normalized"):
         center_name = normalize_text(group["FinalCenterName"].iloc[0]) if "FinalCenterName" in group.columns else ""
         label = center_name or identifier_value or "Unknown Center"
-        write_df_to_sheet(wb, f"{label[:20]}", group, title=f"{label} Detail")
+        write_df_to_sheet(wb, f"{label[:20]}", sort_payables_first(group), title=f"{label} Detail")
 
     return wb
 
@@ -1632,7 +1712,14 @@ def send_vendor_workbook_emails(vendor_files, sender_email, gmail_app_password, 
             msg["From"] = sender_email
             msg["To"] = to_email
             msg["CC"] = item["CC"]
-            msg.set_content(build_email_body(item["CenterName"], item["Identifier"], item["TotalRows"], item["PayableY"], report_name))
+            add_livmed_signature_email_body(
+                msg,
+                item["CenterName"],
+                item["Identifier"],
+                item["TotalRows"],
+                item["PayableY"],
+                report_name,
+            )
             msg.add_attachment(
                 item["FileBytes"],
                 maintype="application",
